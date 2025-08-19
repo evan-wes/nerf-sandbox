@@ -1,7 +1,6 @@
 """
 Contains the NeRF class that implements the multi-layer perceptron
-with skip connections as described in
-
+with skip connections as described in the original paper
 https://arxiv.org/pdf/2003.08934 NeRF: Representing Scenes as
 Neural Radiance Fields for View Synthesis
 """
@@ -19,8 +18,8 @@ class NeRF(nn.Module):
 
     def __init__(
         self,
-        enc_pos_dim: int = 60,
-        enc_dir_dim: int = 24,
+        num_enc_freq_pos: int = 10,
+        num_enc_freq_dir: int = 4,
         n_layers: int = 8,
         hidden_dim: int = 256,
         skip_pos: int = 5
@@ -32,12 +31,14 @@ class NeRF(nn.Module):
 
         Parameters
         ----------
-        enc_pos_dim : int, optional
-            The dimension of the encoded position vector. If k frequencies are used in
-            encoding, the dimension of the encoded vector is 2k*3. Default is 60 (k=10).
-        enc_dir_dim : int, optional
-            The dimension of the encoded direction vector. If k frequencies are used in
-            encoding, the dimension of the encoded vector is 2k*3. Default is 24 (k=4).
+        num_enc_freq_pos : int, optional
+            The number of frequencies used in the encoding of the positions. If this
+            number is k, the input encoded position tensors have dimension 2k*3. Default
+            is 10.
+        num_enc_freq_dir : int, optional
+            The number of frequencies used in the encoding of the directions. If this
+            number is k, the input encoded position tensors have dimension 2k*3. Default
+            is 4.
         n_layers : int, optional
             The number of fully-connected hidden layers. Default is 8.
         hidden_dim : int, optional
@@ -49,6 +50,10 @@ class NeRF(nn.Module):
 
         """
         super(NeRF, self).__init__()
+
+        # Compute input dimensions for the encoded positions and directions
+        enc_pos_dim = 2*num_enc_freq_pos*3
+        enc_dir_dim = 2*num_enc_freq_dir*3
 
         self.skip_pos = skip_pos
 
