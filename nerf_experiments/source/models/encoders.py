@@ -75,23 +75,23 @@ class PositionalEncoder(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of shape (batch_size, D), where D = input_dims provided to the class init
+            Input tensor of shape (num_rays, D), where D = input_dims provided to the class init
 
         Returns
         -------
         torch.Tensor
-            Encoded tensor of shape (batch_size, self.out_dim)
+            Encoded tensor of shape (num_rays, self.out_dim)
         """
 
-        # x[batch_size, None, D] * [F] -> [batch_size, F, D]
+        # [num_rays, None, D] * [F] -> [num_rays, F, D]
         scale = (2 * torch.pi) if self.use_two_pi else 1.0
         xb = x.unsqueeze(-2) * (self.freq_bands * scale).unsqueeze(-1)  # broadcast
 
-        # [batch_size, F, D] -> [batch_size, F, D] each
+        # [num_rays, F, D] -> [num_rays, F, D] each
         sin_feats = torch.sin(xb)
         cos_feats = torch.cos(xb)
 
-        # Flatten freq and dim: [batch_size, F*D]
+        # Flatten freq and dim: [num_rays, F*D]
         enc = torch.cat([sin_feats, cos_feats], dim=-2).reshape(*x.shape[:-1], -1)
 
         if self.include_input:

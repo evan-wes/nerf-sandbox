@@ -1,0 +1,27 @@
+data:
+  kind: colmap         # blender|llff|colmap|custom
+  root: /data/scene
+  undistort: true
+  white_bg: false
+  aabb: [-1, -1, -1, 1, 1, 1]
+
+camera:
+  ndc: false
+  near: 0.1
+  far: 5.0
+  model: 'opencv'      # 'pinhole' if undistorted
+
+train:
+  rays_per_batch: 4096
+  max_steps: 200k
+  amp: true
+  val_every: 5k
+
+render:
+  Nc: 64
+  Nf: 128
+  det_fine: false
+
+encoding:
+  pos: {num_freqs: 10, max_freq_log2: 9, include_input: true}
+  dir: {num_freqs: 4,  max_freq_log2: 3, include_input: true}

@@ -1,8 +1,5 @@
 """
-Contains the NeRF class that implements the multi-layer perceptron
-with skip connections as described in the original paper
-https://arxiv.org/pdf/2003.08934 NeRF: Representing Scenes as
-Neural Radiance Fields for View Synthesis
+Contains implementations of multi-layer perceptrons.
 """
 
 import torch
@@ -12,8 +9,7 @@ import torch.nn.functional as F
 class NeRF(nn.Module):
     """
     Implements the multi-layer perceptron archicture as described in
-    Figure 7. of https://arxiv.org/pdf/2003.08934 NeRF: Representing Scenes as
-    Neural Radiance Fields for View Synthesis
+    Figure 7. of the original NeRF paper (Mildenhall et al. 2020).
     """
 
     def __init__(
@@ -93,14 +89,14 @@ class NeRF(nn.Module):
         Parameters
         ----------
         enc_pos : torch.Tensor
-            Tensor of encoded positions, size [batch_size, enc_pos_dim]
+            Tensor of encoded positions, shape (num_rays, enc_pos_dim)
         enc_dir : torch.Tensor
-            Tensor of encoded directions, size [batch_size, enc_dir_dim]
+            Tensor of encoded directions, shape (num_rays, enc_dir_dim)
 
         Returns
         -------
         torch.Tensor
-            Predicted color and volume density tensor or dimension [batch_size, 4]
+            Predicted color and volume density tensor or dimension [num_rays, 4]
             where the outputs are [Red, Green, Blue, sigma]
         """
 
