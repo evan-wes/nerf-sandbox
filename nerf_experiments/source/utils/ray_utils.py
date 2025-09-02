@@ -27,11 +27,10 @@ def get_camera_rays(
     image_w : int
         Width of the image in pixels
     intrinsic_matrix : np.ndarray | torch.Tensor
-        Camera intrinsic matrix with shape (num_rays, 3, 3).
+        Camera intrinsic matrix with shape (3, 3).
     transform_camera_to_world : np.ndarray | torch.Tensor
         Transformation matrix from the camera's local frame to the world frame.
-        Can be shape (num_rays, 3, 4) or (num_rays, 4, 4) with the first
-        three rows being [R | t].
+        Can be shape (3, 4) or (4, 4) with the first three rows being [R | t].
     device : str | torch.device, optional
         The device to move the tensors of generated rays to. Defaults to None.
     dtype : np.dtype | torch.dtype, optional
@@ -53,12 +52,14 @@ def get_camera_rays(
     ray_origins_world : torch.Tensor
         Tensor of shape (N, 3) with dtype and device specified by the inputs
         representing the origins of each ray in the world frame or NDC coordinates.
-        N is equal to the product of the input image width and height.
+        N is equal to the product of the input image width and height if pixels_xy
+        is not provided, otherwise len(pixels_xy).
     ray_directions_world : torch.Tensor
         Tensor of shape (N, 3) with dtype and device specified by the inputs
         representing the directions of each ray in the world frame or NDC coordinates.
-        N is equal to the product of the input image width and height. The vectors are
-        normalized if the input `normalize_dirs` flag is True.
+        N is equal to the product of the input image width and height if pixels_xy
+        is not provided, otherwise len(pixels_xy). The vectors are normalized if the
+        input `normalize_dirs` flag is True.
     """
 
     # Standardize the input arrays
@@ -92,7 +93,7 @@ def get_camera_rays(
             torch.arange(image_w, device=intrinsic_matrix.device, dtype=dtype),
             torch.arange(image_h, device=intrinsic_matrix.device, dtype=dtype),
             indexing="xy"
-        )  # each [W, H]
+        )  # each shape [W, H]
         x_img = i.reshape(-1)  # [N]
         y_img = j.reshape(-1)  # [N]
 
@@ -106,13 +107,13 @@ def get_camera_rays(
     y_cam = (y_img - c_y) / f_y
     ones  = torch.ones_like(x_cam)
 
-    ray_directions_camera = torch.stack([x_cam, y_cam, ones], dim=-1)  # shape (W, H, 3)
+    ray_directions_camera = torch.stack([x_cam, y_cam, ones], dim=-1)  # shape [N, 3]
 
     # Rotate directions to world frame
     # dirs_world = dirs_cam @ R^T
     ray_directions_world = (
         ray_directions_camera[..., None, :] @ rotation.transpose(-1, -2)
-    ).squeeze(-2)  # shape (W, H, 3)
+    ).squeeze(-2)  # shape (N, 3)
 
     # Skip normalization if returning rays in NDC coordinates
     if normalize_dirs and not as_ndc:
@@ -121,11 +122,7 @@ def get_camera_rays(
         )
 
     # Ray origins: camera position in world for every pixel
-    ray_origins_world = translation.expand_as(ray_directions_world)  # shape (W, H, 3)
-
-    # Flatten to [H*W, 3] with row-major (y,x) order
-    ray_origins_world = ray_origins_world.permute(1, 0, 2).reshape(-1, 3)
-    ray_directions_world = ray_directions_world.permute(1, 0, 2).reshape(-1, 3)
+    ray_origins_world = translation.expand_as(ray_directions_world)  # shape (N, 3)
 
     # If not transforming to NDC coordinates, return
     if not as_ndc:

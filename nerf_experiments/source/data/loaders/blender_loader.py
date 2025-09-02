@@ -195,7 +195,7 @@ class BlenderSceneLoader:
 
         # Infer image size from the first frame
         first_img_path = self._resolve_image_path(frames_json[0]["file_path"])
-        img0 = self._load_image(first_img_path)
+        img0 = self._imread_float(first_img_path)
         H, W = img0.shape[:2]
 
         # Intrinsics from FOV (adjust for downscale)

@@ -32,40 +32,42 @@ def test_missing_transforms_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         loader.load("train")
 
+@pytest.mark.parametrize("downscale", [1, 2, 4])
+def test_intrinsics_and_resize_across_downscale(tmp_path: Path, downscale: int):
+    # Create small RGB images (HxW = 4x6)
+    H0, W0 = 4, 6
+    names = ["r_000", "r_001"]
+    for n in names:
+        _write_png(tmp_path / f"{n}.png", np.full((H0, W0, 3), 128, dtype=np.uint8))
 
-def test_load_basic_and_intrinsics_downscale(tmp_path: Path):
-    # Create two simple RGB images (6x4) and transforms
-    H, W = 4, 6
-    img_dir = tmp_path
-    img_names = ["r_000", "r_001"]
-    for name in img_names:
-        _write_png(img_dir / f"{name}.png", np.full((H, W, 3), 128, dtype=np.uint8))
-
-    # Identity c2w poses
+    # Identity poses
     T = np.eye(4, dtype=np.float32)
-    transforms_path = tmp_path / "transforms_train.json"
-    _make_transforms(transforms_path, [(n, T) for n in img_names], camera_angle_x=np.deg2rad(60))
+    _make_transforms(tmp_path / "transforms_train.json", [(n, T) for n in names],
+                     camera_angle_x=np.deg2rad(60))
 
-    # Downscale by 2 → images become (2x3), intrinsics scaled
-    loader = BlenderSceneLoader(tmp_path, downscale=2, white_bg=True)
+    # Load with parameterized downscale
+    loader = BlenderSceneLoader(tmp_path, downscale=downscale, white_bg=True)
     scene = loader.load("train")
 
+    # Expect images resized by factor
+    H, W = H0 // downscale, W0 // downscale
     assert len(scene.frames) == 2
-    assert scene.white_bg is True
-    # Check image shapes and dtype range
     for fr in scene.frames:
-        assert fr.image.shape[:2] == (H // 2, W // 2)
+        assert fr.image.shape[:2] == (H, W)
         assert fr.image.dtype == np.float32
         assert np.all(fr.image >= 0.0) and np.all(fr.image <= 1.0)
 
-    # Intrinsics from FOV=60deg at original size, then divided by 2
-    # fx = W / (2*tan(fov/2)) at W=6 → fx0
-    fx0 = W / (2.0 * np.tan(np.deg2rad(60) * 0.5))
+    # Intrinsics from full-res FOV=60°, scaled once by downscale
+    fx0 = W0 / (2.0 * np.tan(np.deg2rad(60) * 0.5))
     K = scene.frames[0].K
-    assert np.isclose(K[0, 0], fx0 / 2.0, rtol=1e-5)
-    assert np.isclose(K[1, 1], fx0 / 2.0, rtol=1e-5)
-    assert np.isclose(K[0, 2], (W * 0.5) / 2.0, rtol=1e-5)
-    assert np.isclose(K[1, 2], (H * 0.5) / 2.0, rtol=1e-5)
+    s = float(downscale)
+
+    # fx, fy
+    assert np.isclose(K[0, 0], fx0 / s, rtol=1e-6)
+    assert np.isclose(K[1, 1], fx0 / s, rtol=1e-6)
+    # cx, cy
+    assert np.isclose(K[0, 2], (W0 * 0.5) / s, rtol=1e-6)
+    assert np.isclose(K[1, 2], (H0 * 0.5) / s, rtol=1e-6)
 
 
 def test_center_origin_recenters_poses(tmp_path: Path):
