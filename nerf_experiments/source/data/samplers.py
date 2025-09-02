@@ -78,15 +78,15 @@ class RandomPixelRaySampler(RaySampler):
         while True:
             # 1) Sample B (frame, y, x) tuples
             img_idx = torch.from_numpy(rng.integers(0, len(self._imgs), size=self.B)).to(device)
-            ys      = torch.from_numpy(rng.integers(0, H, size=self.B)).to(device)
-            xs      = torch.from_numpy(rng.integers(0, W, size=self.B)).to(device)
+            ys = torch.from_numpy(rng.integers(0, H, size=self.B)).to(device)
+            xs = torch.from_numpy(rng.integers(0, W, size=self.B)).to(device)
 
             # 2) Group by unique frame to avoid per-pixel loops
             uniq_imgs, inverse = torch.unique(img_idx, sorted=False, return_inverse=True)
 
             rays_o_chunks = []
             rays_d_chunks = []
-            rgb_chunks    = []
+            rgb_chunks = []
 
             for ui, img_id in enumerate(uniq_imgs.tolist()):
                 # Select all pixels in this batch that come from the same frame

@@ -14,8 +14,8 @@ class NeRF(nn.Module):
 
     def __init__(
         self,
-        num_enc_freq_pos: int = 10,
-        num_enc_freq_dir: int = 4,
+        enc_pos_dim: int,
+        enc_dir_dim: int,
         n_layers: int = 8,
         hidden_dim: int = 256,
         skip_pos: int = 5
@@ -27,14 +27,10 @@ class NeRF(nn.Module):
 
         Parameters
         ----------
-        num_enc_freq_pos : int, optional
-            The number of frequencies used in the encoding of the positions. If this
-            number is k, the input encoded position tensors have dimension 2k*3. Default
-            is 10.
-        num_enc_freq_dir : int, optional
-            The number of frequencies used in the encoding of the directions. If this
-            number is k, the input encoded position tensors have dimension 2k*3. Default
-            is 4.
+        enc_pos_dim : int
+            Dimension of the encoded position input
+        enc_dir_dim : int
+            Dimension of the encoded direction input
         n_layers : int, optional
             The number of fully-connected hidden layers. Default is 8.
         hidden_dim : int, optional
@@ -47,40 +43,39 @@ class NeRF(nn.Module):
         """
         super(NeRF, self).__init__()
 
-        # Compute input dimensions for the encoded positions and directions
-        enc_pos_dim = 2*num_enc_freq_pos*3
-        enc_dir_dim = 2*num_enc_freq_dir*3
-
+        self.enc_pos_dim = enc_pos_dim
+        self.enc_dir_dim = enc_dir_dim
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
         self.skip_pos = skip_pos
 
         #----- Multi-layer perceptron trunk -----#
         layers = []
-        in_dim = enc_pos_dim
-        for idx in range(n_layers):
-            # Output dimension is always fixed in the MLP
-            out_dim = hidden_dim
-            if idx == skip_pos:
-                # Adjust input dimension to account for concatenation
-                in_dim = hidden_dim + enc_pos_dim
-            # Add the layer
-            layers.append(nn.Linear(in_dim, out_dim))
-            # Adjust the input dimension to match the output dimension
-            in_dim = out_dim
+        in_dim = self.enc_pos_dim
+        for idx in range(self.n_layers):
+            # Create the current layer with the current input dimension
+            layers.append(nn.Linear(in_dim, self.hidden_dim))
+            if idx == self.skip_pos:
+                # Adjust input dimension to account for concatenation for the next layer
+                in_dim = self.hidden_dim + self.enc_pos_dim
+            else:
+                in_dim = self.hidden_dim
+
         self.mlp = nn.ModuleList(layers)
 
         #----- Feature vector layer -----#
-        self.feature = nn.Linear(hidden_dim, hidden_dim)
+        self.feature = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         #----- Volume density branch -----#
         # Receives the MLP output and produces a scalar
-        self.sigma_out = nn.Linear(hidden_dim, 1)
+        self.sigma_out = nn.Linear(self.hidden_dim, 1)
 
         #----- Color branch -----#
         # Receives the MLP output concatenated with the encoded direction,
         # produces an intermediate vector half the size of the hidden layers,
         # and then the color
-        self.color_fc = nn.Linear(hidden_dim + enc_dir_dim, hidden_dim//2)
-        self.color_out = nn.Linear(hidden_dim//2, 3)
+        self.color_fc = nn.Linear(self.hidden_dim + self.enc_dir_dim, self.hidden_dim//2)
+        self.color_out = nn.Linear(self.hidden_dim//2, 3)
 
     def forward(self, enc_pos: torch.Tensor, enc_dir: torch.Tensor) -> torch.Tensor:
         """

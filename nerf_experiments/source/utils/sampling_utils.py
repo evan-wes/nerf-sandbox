@@ -57,6 +57,8 @@ def sample_pdf(
 
 
     # Get the positions in the CDF that bracket each of the sampled points between 0 and 1
+    cdf = cdf.contiguous()
+    u = u.contiguous()
     indices = torch.searchsorted(cdf, u, right=True)
     below = (indices - 1).clamp(min=0)
     above = indices.clamp(max=cdf.shape[-1] - 1)

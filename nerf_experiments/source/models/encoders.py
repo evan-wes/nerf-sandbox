@@ -66,7 +66,7 @@ class PositionalEncoder(nn.Module):
         # Register as buffer so it follows the module's device/dtype
         self.register_buffer('freq_bands', freq_bands, persistent=False)
 
-        self.out_dim = (input_dims if include_input else 0) + input_dims * num_freqs * 2
+        self.out_dim = (self.input_dims if self.include_input else 0) + self.input_dims * self.num_freqs * 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
