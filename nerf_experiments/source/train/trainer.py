@@ -14,10 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
+from tqdm import tqdm
 
 from nerf_experiments.source.data.loaders.blender_loader import BlenderSceneLoader
 from nerf_experiments.source.data.samplers import RandomPixelRaySampler
 from nerf_experiments.source.utils.ray_utils import get_camera_rays
+from nerf_experiments.source.utils.pose_utils import look_at
 
 from nerf_experiments.source.models.encoders import PositionalEncoder
 from nerf_experiments.source.models.mlps import NeRF
@@ -78,7 +80,7 @@ class Trainer:
 
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
-        # 1) Load scene (Blender path here; extend for LLFF/COLMAP in your loader later)
+        # 1) Load scenes (train + val for previews)  (Blender path here; extend for LLFF/COLMAP in your loader later)
         loader = BlenderSceneLoader(
             root=cfg.data_root,
             downscale=cfg.downscale,
@@ -86,7 +88,22 @@ class Trainer:
             scene_scale=1.0,
             center_origin=False,
         )
-        self.scene = loader.load(cfg.split)
+        # training scene
+        self.train_scene = loader.load(cfg.split)
+
+        # validation scene (prefer "val", fallback → "test", then → train)
+        self.val_scene = None
+        for split_name in ("val", "test"):
+            try:
+                self.val_scene = loader.load(split_name)
+                break
+            except FileNotFoundError:
+                pass
+        if self.val_scene is None:
+            # fallback for smoke tests if val/test not present
+            self.val_scene = self.train_scene
+        # Which frame to render for previews (can be overridden by CLI)
+        self.val_frame_idx = getattr(self, "val_frame_idx", 0)
 
         # 2) Near/Far (RuntimeTrainConfig already resolved these)
         self.near = float(cfg.near)
@@ -94,7 +111,7 @@ class Trainer:
 
         # 3) Sampler
         self.sampler = RandomPixelRaySampler(
-            self.scene,
+            self.train_scene,
             rays_per_batch=cfg.rays_per_batch,
             device=self.device,
             white_bg_composite=cfg.white_bg,
@@ -185,7 +202,12 @@ class Trainer:
 
     @torch.no_grad()
     def validate_full_image(self, frame_idx: int = 0) -> dict[str, torch.Tensor]:
-        frame = self.scene.frames[frame_idx]
+        # Clamp index into available frames
+        frames = self.val_scene.frames
+        if len(frames) == 0:
+            raise RuntimeError("Validation scene has no frames.")
+        fid = int(max(0, min(frame_idx, len(frames) - 1)))
+        frame = frames[fid]
         H, W = frame.image.shape[:2]
         rays_o, rays_d = get_camera_rays(
             image_h=H, image_w=W, intrinsic_matrix=frame.K, transform_camera_to_world=frame.c2w,
@@ -240,7 +262,7 @@ class Trainer:
             if step % self.cfg.val_every == 0:
                 self.nerf_c.eval(); self.nerf_f.eval()
                 with torch.no_grad():
-                    val = self.validate_full_image(frame_idx=0)
+                    val = self.validate_full_image(frame_idx=self.val_frame_idx)
                 self.nerf_c.train(); self.nerf_f.train()
                 save_rgb_png(val["rgb"], self.out_dir / f"preview_{step}.png")
 
@@ -258,3 +280,119 @@ class Trainer:
         }
         torch.save(ckpt, self.out_dir / f"ckpt_{step}.pt")
         torch.save(ckpt, self.out_dir / "ckpt_latest.pt")
+
+    @torch.no_grad()
+    def render_pose(self, c2w: torch.Tensor, H: int, W: int, K: np.ndarray | torch.Tensor, chunk: int = 8192) -> torch.Tensor:
+        """
+        Render RGB for a single camera pose (c2w), returns [H,W,3] in [0,1].
+        Uses deterministic sampling for validation-quality output.
+        """
+        rays_o, rays_d = get_camera_rays(
+            image_h=H, image_w=W, intrinsic_matrix=K, transform_camera_to_world=c2w,
+            device=self.device, dtype=torch.float32, normalize_dirs=True, as_ndc=False, near_plane=self.near,
+            pixels_xy=None,
+        )
+        out_rgb = []
+        for i in range(0, H*W, chunk):
+            ro = rays_o[i:i+chunk]; rd = rays_d[i:i+chunk]
+            Bc = ro.shape[0]
+            # coarse
+            zc = stratified_samples(self.near, self.far, self.nc, Bc, device=self.device, dtype=ro.dtype, perturb=False)
+            comp_c, w_c, _, _ = self._forward_nerf(ro, rd, zc, self.nerf_c)
+            # pdf → fine
+            mids = 0.5 * (zc[:, 1:] + zc[:, :-1])
+            zf = sample_pdf(mids, w_c[:, 1:-1], n_samples=self.nf, deterministic=True)
+            z_all = torch.sort(torch.cat([zc, zf], dim=-1), dim=-1).values
+            comp_f, _, _, _ = self._forward_nerf(ro, rd, z_all, self.nerf_f)
+            out_rgb.append(comp_f)
+        img = torch.cat(out_rgb, dim=0).reshape(H, W, 3)
+        return img
+
+
+    @torch.no_grad()
+    def render_camera_path(
+        self,
+        out_dir: str | Path,
+        n_frames: int = 120,
+        fps: int = 30,
+        path_type: str = "circle",    # "circle" | "spiral"
+        radius: float | None = None,
+        elevation_deg: float = 0.0,
+        yaw_range_deg: float = 360.0,
+        res_scale: float = 1.0,
+        look_at_target: torch.Tensor | None = None,
+        save_video: bool = True,
+    ) -> None:
+        """
+        Generate a path of c2w poses and render frames with current NeRF.
+        Saves PNG sequence and optionally MP4 (if imageio-ffmpeg is available).
+        - path_type="circle": camera moves on a horizontal circle at fixed elevation.
+        - path_type="spiral": camera moves on a spiral (radius slowly changes).
+        """
+        out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+        # Use validation intrinsics by default
+        frame0 = self.val_scene.frames[0]
+        H0, W0 = frame0.image.shape[:2]
+        H = int(round(H0 * res_scale))
+        W = int(round(W0 * res_scale))
+        # round up to nearest multiple of 16
+        H = (H + 15) // 16 * 16
+        W = (W + 15) // 16 * 16
+        K = frame0.K.copy()
+        if res_scale != 1.0:
+            K = K.copy()
+            K[0, 0] *= (W / W0); K[1, 1] *= (H / H0)
+            K[0, 2] *= (W / W0); K[1, 2] *= (H / H0)
+
+        # Scene center estimate from train poses
+        centers_np = np.stack([f.c2w[:3, 3] for f in self.train_scene.frames], axis=0).astype(np.float32)  # [N,3]
+        centers = torch.from_numpy(centers_np).to(self.device)  # [N,3]
+        center = centers.mean(dim=0)
+        if look_at_target is None:
+            look_at_target = center
+
+        # Radius default from mean distance of training cameras
+        dists = centers.norm(dim=-1)
+        if radius is None:
+            radius = float(dists.mean().item())
+
+        elev = math.radians(elevation_deg)
+        yaw0 = -0.5 * math.radians(yaw_range_deg)
+        yaw1 = +0.5 * math.radians(yaw_range_deg)
+
+        # Generate poses
+        c2ws = []
+        for t in range(n_frames):
+            a = yaw0 + (yaw1 - yaw0) * (t / max(1, n_frames - 1))
+            r = radius
+            if path_type.lower() == "spiral":
+                # small sinusoidal radius modulation for a gentle spiral
+                r = radius * (0.9 + 0.1 * math.sin(2 * math.pi * t / n_frames))
+            # position in world
+            eye = torch.tensor([
+                r * math.cos(a) * math.cos(elev),
+                r * math.sin(elev),
+                r * math.sin(a) * math.cos(elev),
+            ], device=self.device, dtype=torch.float32) + center
+            c2w = look_at(eye, look_at_target.to(self.device))
+            c2ws.append(c2w)
+
+        # Render frames
+        png_paths = []
+        for idx, pose in enumerate(tqdm(c2ws, desc="Rendering path", unit="frame")):
+            img = self.render_pose(pose, H=H, W=W, K=K)
+            path = out_dir / f"path_{idx:04d}.png"
+            save_rgb_png(img, path)
+            png_paths.append(path)
+
+        # Optional MP4
+        if save_video:
+            try:
+                import imageio
+                mp4_path = out_dir / "render_path.mp4"
+                with imageio.get_writer(mp4_path, fps=fps, codec="libx264", quality=8) as w:
+                    for p in png_paths:
+                        w.append_data(imageio.v2.imread(p))
+                print(f"[render] Wrote {mp4_path}")
+            except Exception as e:
+                print(f"[render] Could not write MP4 ({e}); PNG sequence saved at {out_dir}")
