@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import argparse
+import os
 from pathlib import Path
 from typing import Dict, Any
 
@@ -31,7 +32,7 @@ def main():
     ap.add_argument("--rays_per_batch", type=str, default=None,
                     help="Override train.rays_per_batch (accepts 4k, etc).")
 
-    # validation controls
+    # Validation controls
     ap.add_argument("--val_every_steps", type=str, default=None,
                     help="Override train.val_every (accepts 1k, 500, etc).")
     ap.add_argument("--val_frame_idx", type=int, default=0,
@@ -47,7 +48,46 @@ def main():
     ap.add_argument("--path_yaw_deg", type=float, default=360.0)
     ap.add_argument("--path_res_scale", type=float, default=1.0)
 
+    # Memory / allocator controls
+    ap.add_argument("--cuda-expandable-segments", action="store_true",
+                    help="Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing torch.")
+    ap.add_argument("--micro-chunks", type=int, default=0,
+                    help="If >0, split each training ray batch into this many micro-chunks with per-chunk backward.")
+    ap.add_argument("--ckpt-mlp", action="store_true",
+                    help="Enable gradient checkpointing around NeRF MLP forward to save activation memory.")
+
+    # TensorBoard logging
+    ap.add_argument("--tensorboard", action="store_true",
+                    help="Enable TensorBoard logging of metrics and GPU vitals.")
+    ap.add_argument("--tb-logdir", type=str, default=None,
+                    help="Optional TensorBoard log directory. Defaults to <save_dir>/tb.")
+    ap.add_argument("--tb-group-root", type=str, default=None,
+                    help="Optional directory to collect multiple runs for comparison. "
+                         "Creates a symlink <tb-group-root>/<run_name> -> <save_dir>/tb.")
+
+    # Thermal safety controls
+    ap.add_argument("--gpu-temp-threshold", type=int, default=85,
+                    help="If GPU temp (°C) exceeds this, trigger thermal response. Default: 85.")
+    ap.add_argument("--gpu-temp-check-every", type=int, default=20,
+                    help="How many training steps between temperature checks. Default: 20.")
+    ap.add_argument("--gpu-cooldown-seconds", type=int, default=45,
+                    help="How long to sleep when too hot (if not using auto-throttle). Default: 45.")
+    ap.add_argument("--thermal-throttle", action="store_true",
+                    help="When hot, automatically increase micro-chunks up to a cap instead of sleeping.")
+    ap.add_argument("--thermal-throttle-max-micro", type=int, default=16,
+                    help="Upper bound for micro-chunks when --thermal-throttle is enabled. Default: 16.")
+    ap.add_argument("--thermal-throttle-sleep", type=float, default=5.0,
+                    help="Brief sleep (seconds) after applying throttle, to let temps settle. Default: 5.0.")
+
+
     args = ap.parse_args()
+
+    # Set CUDA allocator before any torch import
+    if args.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # Delay importing Trainer (which pulls in torch) until after env is set
+    from nerf_experiments.source.train.trainer import Trainer
 
     # 1) Load YAML → sectioned config
     ydict: Dict[str, Any] = load_yaml_config(args.config)
@@ -75,8 +115,22 @@ def main():
 
     # 5) Train
     trainer = Trainer(rt_cfg)
-    # NEW: set which frame to validate (Trainer uses this attr if present)
+    # pass runtime toggles for memory behavior
+    setattr(trainer, "micro_chunks", int(max(0, args.micro_chunks)))
+    setattr(trainer, "ckpt_mlp", bool(args.ckpt_mlp))
+    # tensorboard toggles
+    setattr(trainer, "use_tb", bool(args.tensorboard))
+    setattr(trainer, "tb_logdir", args.tb_logdir)
+    # thermal toggles
+    setattr(trainer, "gpu_temp_threshold", int(args.gpu_temp_threshold))
+    setattr(trainer, "gpu_temp_check_every", int(max(1, args.gpu_temp_check_every)))
+    setattr(trainer, "gpu_cooldown_seconds", int(max(0, args.gpu_cooldown_seconds)))
+    setattr(trainer, "thermal_throttle", bool(args.thermal_throttle))
+    setattr(trainer, "thermal_throttle_max_micro", int(max(1, args.thermal_throttle_max_micro)))
+    setattr(trainer, "thermal_throttle_sleep", float(max(0.0, args.thermal_throttle_sleep)))
+    # set which frame to validate (Trainer uses this attr if present)
     setattr(trainer, "val_frame_idx", int(args.val_frame_idx))
+
     trainer.train()
 
     # 6) Render video

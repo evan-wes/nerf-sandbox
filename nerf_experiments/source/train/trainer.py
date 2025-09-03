@@ -7,14 +7,17 @@ import math, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict
+import subprocess
 
+from PIL import Image
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from PIL import Image
-from tqdm import tqdm
+from torch.utils.checkpoint import checkpoint
+from torch.utils.tensorboard import SummaryWriter
 
 from nerf_experiments.source.data.loaders.blender_loader import BlenderSceneLoader
 from nerf_experiments.source.data.samplers import RandomPixelRaySampler
@@ -155,6 +158,133 @@ class Trainer:
         self.nf = int(cfg.nf)
         self.det_fine = bool(cfg.det_fine)
 
+        # optional runtime toggles injected from driver (train_nerf.py)
+        self.micro_chunks: int = getattr(self, "micro_chunks", 0)  # 0 = disabled
+        self.ckpt_mlp: bool = getattr(self, "ckpt_mlp", False)
+
+
+
+        # thermal safety toggles (can be absent; provide sane defaults)
+        self.gpu_temp_threshold: int = getattr(self, "gpu_temp_threshold", 85)
+        self.gpu_temp_check_every: int = getattr(self, "gpu_temp_check_every", 20)
+        self.gpu_cooldown_seconds: int = getattr(self, "gpu_cooldown_seconds", 45)
+        self.thermal_throttle: bool = getattr(self, "thermal_throttle", False)
+        self.thermal_throttle_max_micro: int = getattr(self, "thermal_throttle_max_micro", 16)
+        self.thermal_throttle_sleep: float = getattr(self, "thermal_throttle_sleep", 5.0)
+        self._last_temp_check_step: int = 0
+        self._pynvml_ready: bool = self._maybe_init_pynvml()
+        # tensorboard
+        self.use_tb: bool = getattr(self, "use_tb", False)
+        self.tb_logdir: str | None = getattr(self, "tb_logdir", None)
+        self._tb: SummaryWriter | None = None
+        if self.use_tb:
+            logdir = self.tb_logdir
+            if not logdir:
+                # prefer cfg.save_dir/tb if available; otherwise ./runs
+                base = getattr(self.cfg, "save_dir", None) or "."
+                logdir = str(Path(base) / "tb")
+            try:
+                self._tb = SummaryWriter(logdir)
+                print(f"[TB] Logging to: {logdir}")
+            except Exception as e:
+                print(f"[TB] Failed to create SummaryWriter: {e}")
+                self._tb = None
+
+    # ---------- Thermal helpers ----------
+    def _maybe_init_pynvml(self) -> bool:
+        try:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            return False
+
+    def _read_gpu_stats(self) -> dict:
+        """
+        Returns a dict with keys:
+          temp_c, util_pct, mem_used_mb, mem_total_mb
+        Missing fields may be None if not available.
+        """
+        stats = {"temp_c": None, "util_pct": None, "mem_used_mb": None, "mem_total_mb": None}
+        if getattr(self, "_pynvml_ready", False):
+            try:
+                t = self._nvml.nvmlDeviceGetTemperature(self._nvml_handle, self._nvml.NVML_TEMPERATURE_GPU)
+                util = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                mem = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                stats["temp_c"] = int(t)
+                stats["util_pct"] = int(util.gpu)
+                stats["mem_used_mb"] = int(mem.used // (1024 * 1024))
+                stats["mem_total_mb"] = int(mem.total // (1024 * 1024))
+                return stats
+            except Exception:
+                pass
+        # Fallback to nvidia-smi (slower)
+        try:
+            out = subprocess.check_output([
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits"
+            ], stderr=subprocess.DEVNULL)
+            line = out.decode("utf-8").strip().splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                stats["temp_c"] = int(parts[0])
+                stats["util_pct"] = int(parts[1])
+                stats["mem_used_mb"] = int(parts[2])
+                stats["mem_total_mb"] = int(parts[3])
+        except Exception:
+            pass
+        return stats
+
+    def _thermal_guard(self, step: int):
+        """Check temperature every N steps; throttle or sleep if too hot."""
+        if self.gpu_temp_check_every <= 0:
+            return
+        if step - self._last_temp_check_step < self.gpu_temp_check_every:
+            return
+        self._last_temp_check_step = step
+
+        # read and log GPU vitals
+        gpu = self._read_gpu_stats()
+        t = gpu.get("temp_c")
+        if self._tb is not None:
+            # push vitals to TensorBoard
+            if gpu["temp_c"] is not None:
+                self._tb.add_scalar("gpu/temp_c", gpu["temp_c"], step)
+            if gpu["util_pct"] is not None:
+                self._tb.add_scalar("gpu/util_pct", gpu["util_pct"], step)
+            if gpu["mem_used_mb"] is not None:
+                self._tb.add_scalar("gpu/mem_used_mb", gpu["mem_used_mb"], step)
+            if gpu["mem_total_mb"] is not None:
+                self._tb.add_scalar("gpu/mem_total_mb", gpu["mem_total_mb"], step)
+            self._tb.add_scalar("train/micro_chunks", getattr(self, "micro_chunks", 0) or 0, step)
+
+        if t is None or t < self.gpu_temp_threshold:
+            return
+
+        # Too hot: take action
+        if self.thermal_throttle:
+            # Increase micro-chunks (more splitting → less peak load / heat)
+            prev = int(getattr(self, "micro_chunks", 0) or 1)
+            new = min(max(prev * 2, prev + 1), self.thermal_throttle_max_micro)
+            if new > prev:
+                self.micro_chunks = new
+                print(f"[THERMAL] GPU {t}°C ≥ {self.gpu_temp_threshold}°C → increasing micro-chunks {prev} → {new} "
+                      f"(max {self.thermal_throttle_max_micro}). Sleeping {self.thermal_throttle_sleep:.1f}s.")
+                time.sleep(self.thermal_throttle_sleep)
+            else:
+                # Already at max, brief cooloff anyway
+                print(f"[THERMAL] GPU {t}°C hot and micro-chunks at cap ({self.micro_chunks}). "
+                      f"Cooling for {self.gpu_cooldown_seconds}s.")
+                time.sleep(self.gpu_cooldown_seconds)
+        else:
+            # Simple cooldown sleep
+            print(f"[THERMAL] GPU {t}°C ≥ {self.gpu_temp_threshold}°C → cooling for {self.gpu_cooldown_seconds}s.")
+            time.sleep(self.gpu_cooldown_seconds)
+
+
     def _forward_nerf(self, rays_o: torch.Tensor, rays_d: torch.Tensor, z: torch.Tensor, model: nn.Module):
         B, N = z.shape
         pts = rays_o[:, None, :] + rays_d[:, None, :] * z[..., None]     # [B,N,3]
@@ -164,7 +294,14 @@ class Trainer:
         enc_pos = self.pos_enc(pts.reshape(-1, 3))
         enc_dir = self.dir_enc(vdirs.reshape(-1, 3))
 
-        pred = model(enc_pos, enc_dir)                                    # [B*N, 4]
+        # pred = model(enc_pos, enc_dir)                                    # [B*N, 4]
+
+        # Optional gradient checkpoint around MLP to reduce activation memory
+        if self.ckpt_mlp and self.training:
+            pred = checkpoint(lambda ep, ed: model(ep, ed), enc_pos, enc_dir)
+        else:
+            pred = model(enc_pos, enc_dir)                                # [B*N, 4]
+
         rgb = pred[..., :3].reshape(B, N, 3)
         sigma = pred[..., 3].reshape(B, N)
 
@@ -199,6 +336,45 @@ class Trainer:
             psnr = mse2psnr(loss_f.detach())
 
         return {"loss": loss, "psnr": psnr, "comp_f": comp_f.detach(), "comp_c": comp_c.detach()}
+
+    def train_step_chunked_backward(self, batch, micro_chunks: int) -> dict[str, torch.Tensor]:
+        """
+        Split the current ray batch into `micro_chunks` sub-batches and perform
+        per-chunk forward+backward to cap peak memory. Optimizer stepping is done by caller.
+        """
+        rays_o, rays_d, target = batch["rays_o"], batch["rays_d"], batch["rgb"]
+        B = rays_o.shape[0]
+        m = max(1, int(micro_chunks))
+        chunk = (B + m - 1) // m
+
+        total_loss = 0.0
+        last_psnr = None
+
+        for i in range(0, B, chunk):
+            ro = rays_o[i:i+chunk]; rd = rays_d[i:i+chunk]; tgt = target[i:i+chunk]
+            Bi = ro.shape[0]
+            with torch.amp.autocast(self.device.type, enabled=self.cfg.amp):
+                # --- Coarse ---
+                zc = stratified_samples(self.near, self.far, self.nc, Bi, device=self.device, dtype=ro.dtype, perturb=True)
+                comp_c, w_c, _, _ = self._forward_nerf(ro, rd, zc, self.nerf_c)
+                # --- Fine sampling ---
+                mids = 0.5 * (zc[:, 1:] + zc[:, :-1])
+                w_mid = w_c[:, 1:-1].detach()
+                zf = sample_pdf(mids, w_mid, n_samples=self.nf, deterministic=self.det_fine)
+                z_all = torch.sort(torch.cat([zc, zf], dim=-1), dim=-1).values
+                # --- Fine ---
+                comp_f, _, _, _ = self._forward_nerf(ro, rd, z_all, self.nerf_f)
+                # losses
+                loss_c = F.mse_loss(comp_c, tgt)
+                loss_f = F.mse_loss(comp_f, tgt)
+                loss = (loss_c + loss_f) / m  # scale for accumulation
+                last_psnr = mse2psnr(loss_f.detach())
+
+            self.scaler.scale(loss).backward()
+            total_loss += float(loss.detach().cpu())
+
+        # return a small dict (loss value is just for logging)
+        return {"loss_value": total_loss, "psnr": last_psnr}
 
     @torch.no_grad()
     def validate_full_image(self, frame_idx: int = 0) -> dict[str, torch.Tensor]:
@@ -242,21 +418,49 @@ class Trainer:
         t0 = time.time()
         for step in range(1, self.cfg.max_steps + 1):
             batch = next(it)
+            # self.opt.zero_grad(set_to_none=True)
+
+            # out = self.train_step(batch)
+            # loss = out["loss"]
+
+            # self.scaler.scale(loss).backward()
+            # self.scaler.step(self.opt)
+            # self.scaler.update()
             self.opt.zero_grad(set_to_none=True)
 
-            out = self.train_step(batch)
-            loss = out["loss"]
+            if getattr(self, "micro_chunks", 0) and self.micro_chunks > 0:
+                out = self.train_step_chunked_backward(batch, self.micro_chunks)
+                # step once after all chunks
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                loss_val = out["loss_value"]
+                psnr_val = out["psnr"]
+            else:
+                out = self.train_step(batch)
+                loss = out["loss"]
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                loss_val = float(loss.detach().cpu())
+                psnr_val = out["psnr"]
 
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.opt)
-            self.scaler.update()
+
             if self.sched is not None:
                 self.sched.step()
+
+            # Thermal guard (periodic)
+            self._thermal_guard(step)
 
             if step % self.cfg.log_every == 0:
                 dt = time.time() - t0
                 lr_now = self.opt.param_groups[0]["lr"]
-                print(f"[{step:>7d}] loss={loss.item():.6f} psnr={out['psnr'].item():.2f} lr={lr_now:.2e} ({dt:.2f}s)")
+                # print(f"[{step:>7d}] loss={loss.item():.6f} psnr={out['psnr'].item():.2f} lr={lr_now:.2e} ({dt:.2f}s)")
+                ps = (psnr_val.item() if hasattr(psnr_val, "item") else float(psnr_val))
+                print(f"[{step:>7d}] loss={loss_val:.6f} psnr={ps:.2f} lr={lr_now:.2e} ({dt:.2f}s)")
+                if self._tb is not None:
+                    self._tb.add_scalar("train/loss", loss_val, step)
+                    self._tb.add_scalar("train/psnr", ps, step)
+                    self._tb.add_scalar("train/lr", lr_now, step)
                 t0 = time.time()
 
             if step % self.cfg.val_every == 0:
@@ -268,6 +472,14 @@ class Trainer:
 
             if step % self.cfg.ckpt_every == 0:
                 self.save_ckpt(step)
+
+        # close TB
+        if self._tb is not None:
+            try:
+                self._tb.flush()
+                self._tb.close()
+            except Exception:
+                pass
 
     def save_ckpt(self, step: int):
         ckpt = {
@@ -380,6 +592,7 @@ class Trainer:
         # Render frames
         png_paths = []
         for idx, pose in enumerate(tqdm(c2ws, desc="Rendering path", unit="frame")):
+            time.sleep(5)
             img = self.render_pose(pose, H=H, W=W, K=K)
             path = out_dir / f"path_{idx:04d}.png"
             save_rgb_png(img, path)
