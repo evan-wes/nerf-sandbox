@@ -77,7 +77,7 @@ def make_scheduler(opt: optim.Optimizer, name: str, params: Dict[str, Any]) -> o
 # =============== trainer ===============
 
 class Trainer:
-    def __init__(self, cfg: RuntimeTrainConfig) -> None:
+    def __init__(self, cfg: RuntimeTrainConfig, use_tb: bool = False, tb_logdir: str | None = None, tb_group_root: str | None = None) -> None:
         self.cfg = cfg
         set_global_seed(cfg.seed)
 
@@ -162,8 +162,6 @@ class Trainer:
         self.micro_chunks: int = getattr(self, "micro_chunks", 0)  # 0 = disabled
         self.ckpt_mlp: bool = getattr(self, "ckpt_mlp", False)
 
-
-
         # thermal safety toggles (can be absent; provide sane defaults)
         self.gpu_temp_threshold: int = getattr(self, "gpu_temp_threshold", 85)
         self.gpu_temp_check_every: int = getattr(self, "gpu_temp_check_every", 20)
@@ -173,19 +171,22 @@ class Trainer:
         self.thermal_throttle_sleep: float = getattr(self, "thermal_throttle_sleep", 5.0)
         self._last_temp_check_step: int = 0
         self._pynvml_ready: bool = self._maybe_init_pynvml()
+
+
         # tensorboard
-        self.use_tb: bool = getattr(self, "use_tb", False)
-        self.tb_logdir: str | None = getattr(self, "tb_logdir", None)
-        self._tb: SummaryWriter | None = None
+        self.use_tb = use_tb
+        self.tb_logdir = tb_logdir
+        self.tb_group_root = tb_group_root
+        self._tb = None
         if self.use_tb:
-            logdir = self.tb_logdir
-            if not logdir:
-                # prefer cfg.save_dir/tb if available; otherwise ./runs
-                base = getattr(self.cfg, "save_dir", None) or "."
-                logdir = str(Path(base) / "tb")
+            # Use the already-created experiment directory
+            exp_dir = self.out_dir
+            run_name = exp_dir.name
+            logdir = self.tb_logdir or str(exp_dir / "tb")
             try:
                 self._tb = SummaryWriter(logdir)
-                print(f"[TB] Logging to: {logdir}")
+                print(f"[TB] Logging to: {logdir} (run: {run_name})")
+                # (optional) group-root symlink here…
             except Exception as e:
                 print(f"[TB] Failed to create SummaryWriter: {e}")
                 self._tb = None
@@ -297,8 +298,14 @@ class Trainer:
         # pred = model(enc_pos, enc_dir)                                    # [B*N, 4]
 
         # Optional gradient checkpoint around MLP to reduce activation memory
-        if self.ckpt_mlp and self.training:
-            pred = checkpoint(lambda ep, ed: model(ep, ed), enc_pos, enc_dir)
+        # Use the model's .training flag (True in train mode, False in eval)
+        if self.ckpt_mlp and model.training:
+            # Non-reentrant checkpoint doesn't require input tensors to have requires_grad=True
+            try:
+                pred = checkpoint(lambda ep, ed: model(ep, ed), enc_pos, enc_dir, use_reentrant=False)
+            except TypeError:
+                # Back-compat for older torch that doesn't support use_reentrant kwarg
+                pred = checkpoint(lambda ep, ed: model(ep, ed), enc_pos, enc_dir)
         else:
             pred = model(enc_pos, enc_dir)                                # [B*N, 4]
 
@@ -338,10 +345,6 @@ class Trainer:
         return {"loss": loss, "psnr": psnr, "comp_f": comp_f.detach(), "comp_c": comp_c.detach()}
 
     def train_step_chunked_backward(self, batch, micro_chunks: int) -> dict[str, torch.Tensor]:
-        """
-        Split the current ray batch into `micro_chunks` sub-batches and perform
-        per-chunk forward+backward to cap peak memory. Optimizer stepping is done by caller.
-        """
         rays_o, rays_d, target = batch["rays_o"], batch["rays_d"], batch["rgb"]
         B = rays_o.shape[0]
         m = max(1, int(micro_chunks))
@@ -351,20 +354,30 @@ class Trainer:
         last_psnr = None
 
         for i in range(0, B, chunk):
-            ro = rays_o[i:i+chunk]; rd = rays_d[i:i+chunk]; tgt = target[i:i+chunk]
+            ro = rays_o[i:i+chunk]
+            rd = rays_d[i:i+chunk]
+            tgt_slice = target[i:i+chunk]  # don't cast yet
             Bi = ro.shape[0]
+
             with torch.amp.autocast(self.device.type, enabled=self.cfg.amp):
                 # --- Coarse ---
-                zc = stratified_samples(self.near, self.far, self.nc, Bi, device=self.device, dtype=ro.dtype, perturb=True)
+                zc = stratified_samples(self.near, self.far, self.nc, Bi,
+                                        device=self.device, dtype=ro.dtype, perturb=True)
                 comp_c, w_c, _, _ = self._forward_nerf(ro, rd, zc, self.nerf_c)
+
                 # --- Fine sampling ---
                 mids = 0.5 * (zc[:, 1:] + zc[:, :-1])
                 w_mid = w_c[:, 1:-1].detach()
                 zf = sample_pdf(mids, w_mid, n_samples=self.nf, deterministic=self.det_fine)
                 z_all = torch.sort(torch.cat([zc, zf], dim=-1), dim=-1).values
+
                 # --- Fine ---
                 comp_f, _, _, _ = self._forward_nerf(ro, rd, z_all, self.nerf_f)
-                # losses
+
+                # Now align target to device & dtype of outputs (handles AMP)
+                tgt = tgt_slice.to(device=self.device, dtype=comp_f.dtype, non_blocking=True)
+
+                # Losses
                 loss_c = F.mse_loss(comp_c, tgt)
                 loss_f = F.mse_loss(comp_f, tgt)
                 loss = (loss_c + loss_f) / m  # scale for accumulation
@@ -373,7 +386,6 @@ class Trainer:
             self.scaler.scale(loss).backward()
             total_loss += float(loss.detach().cpu())
 
-        # return a small dict (loss value is just for logging)
         return {"loss_value": total_loss, "psnr": last_psnr}
 
     @torch.no_grad()
@@ -592,7 +604,6 @@ class Trainer:
         # Render frames
         png_paths = []
         for idx, pose in enumerate(tqdm(c2ws, desc="Rendering path", unit="frame")):
-            time.sleep(5)
             img = self.render_pose(pose, H=H, W=W, K=K)
             path = out_dir / f"path_{idx:04d}.png"
             save_rgb_png(img, path)

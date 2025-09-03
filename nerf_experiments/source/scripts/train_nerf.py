@@ -10,7 +10,6 @@ from typing import Dict, Any
 
 from nerf_experiments.source.config.config_utils import load_yaml_config, parse_nerf_config
 from nerf_experiments.source.config.runtime_config import to_runtime_train_config
-from nerf_experiments.source.train.trainer import Trainer
 
 
 def main():
@@ -114,7 +113,13 @@ def main():
     )
 
     # 5) Train
-    trainer = Trainer(rt_cfg)
+    trainer = Trainer(
+        cfg=rt_cfg,
+        use_tb=bool(args.tensorboard),
+        tb_logdir=args.tb_logdir,
+        tb_group_root=args.tb_group_root
+    )
+
     # pass runtime toggles for memory behavior
     setattr(trainer, "micro_chunks", int(max(0, args.micro_chunks)))
     setattr(trainer, "ckpt_mlp", bool(args.ckpt_mlp))
