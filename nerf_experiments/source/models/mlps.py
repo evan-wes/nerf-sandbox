@@ -1,6 +1,7 @@
 """
 Contains implementations of multi-layer perceptrons.
 """
+import math
 
 import torch
 import torch.nn as nn
@@ -18,7 +19,10 @@ class NeRF(nn.Module):
         enc_dir_dim: int,
         n_layers: int = 8,
         hidden_dim: int = 256,
-        skip_pos: int = 5
+        skip_pos: int = 5,
+        acc0: float = 0.05,
+        near: float = 2.0,
+        far: float = 6.0
     ) -> None:
         """
         Constructor for the class. Builds the sequential layer architecture, including
@@ -39,7 +43,12 @@ class NeRF(nn.Module):
             The index of the layer whose activation we concatenate the input encoded
             position vector. Default is 5, i.e. the encoded position is concatenated
             with the fifth layer's activation output vector
-
+        acc0 : float, optional
+            Initial accumulated opacity. Used to initialize sigma. Default is 5 percent
+        near : float, optional
+            Position of the near plane. Default is 2.0
+        far : float, optional
+            Position of the far plane. Default is 6.0
         """
         super(NeRF, self).__init__()
 
@@ -66,16 +75,52 @@ class NeRF(nn.Module):
         #----- Feature vector layer -----#
         self.feature = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-        #----- Volume density branch -----#
-        # Receives the MLP output and produces a scalar
-        self.sigma_out = nn.Linear(self.hidden_dim, 1)
+        #----- Volume density branch (RAW) -----#
+        self.sigma_out = nn.Linear(self.hidden_dim, 1)   # raw sigma logits
 
         #----- Color branch -----#
         # Receives the MLP output concatenated with the encoded direction,
         # produces an intermediate vector half the size of the hidden layers,
         # and then the color
         self.color_fc = nn.Linear(self.hidden_dim + self.enc_dir_dim, self.hidden_dim//2)
-        self.color_out = nn.Linear(self.hidden_dim//2, 3)
+        self.color_out = nn.Linear(self.hidden_dim//2, 3)  # raw rgb logits
+
+        # -------- Recommended initializations --------#
+        b = self._sigma_bias_for_initial_acc(acc0, near=near, far=far)
+        with torch.no_grad():
+            self.sigma_out.bias.fill_(b)
+            # self.sigma_out.weight.mul_(0.1)
+            self.color_out.bias.zero_()
+            self.color_out.weight.mul_(0.1)
+
+        # -------- Recommended initialization --------
+        # with torch.no_grad():
+        #     # Start very transparent so acc << 1 at init
+        #     self.sigma_out.bias.fill_(-10.0)     # try -8 to -12; -10 is a good default for far-near ≈ 4
+        #     self.sigma_out.weight.mul_(0.1)      # small σ head weights
+        #     self.color_out.bias.zero_()
+        #     self.color_out.weight.mul_(0.1)      # small RGB head weights
+
+        self._init_mlp()
+
+    def _sigma_bias_for_initial_acc(self, acc0: float, near: float, far: float) -> float:
+        """Solve for b in softplus(b) so that 1-exp(-softplus(b)*(far-near)) ~= acc0."""
+        acc0 = max(1e-6, min(0.99, acc0))
+        L = float(far - near)
+        # target avg sigma
+        sig = -math.log(1.0 - acc0) / max(1e-8, L)
+        # softplus^{-1}(sig) = log(exp(sig)-1)
+        return float(math.log(math.expm1(sig)))
+
+    def _init_mlp(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
+        nn.init.kaiming_uniform_(self.feature.weight, nonlinearity="linear")
+        nn.init.zeros_(self.feature.bias)
+        nn.init.kaiming_uniform_(self.color_fc.weight, nonlinearity="relu")
+        nn.init.zeros_(self.color_fc.bias)
 
     def forward(self, enc_pos: torch.Tensor, enc_dir: torch.Tensor) -> torch.Tensor:
         """
@@ -105,8 +150,8 @@ class NeRF(nn.Module):
                 # Concatenate the current hidden tensor with the encoded position input
                 hidden_tensor = torch.cat([hidden_tensor, enc_pos], dim=-1)
 
-        # Volume density prediction (additional ReLU ensures non-negativity)
-        sigma = F.relu(self.sigma_out(hidden_tensor))
+        # Volume density (RAW logits; no activation here)
+        sigma_raw = self.sigma_out(hidden_tensor)
 
         # Predict the feature vector without any activation
         feature = self.feature(hidden_tensor)
@@ -114,10 +159,10 @@ class NeRF(nn.Module):
         # Color prediction
         color_input = torch.cat([feature, enc_dir], dim=-1)
         color_hidden = F.relu(self.color_fc(color_input))
-        color_rgb = torch.sigmoid(self.color_out(color_hidden))
+        color_raw = self.color_out(color_hidden)  # RAW logits; no sigmoid here
 
         # Construct the output tensor and return
-        output_tensor = torch.cat([color_rgb, sigma], dim=-1)
+        output_tensor = torch.cat([color_raw, sigma_raw], dim=-1)
 
         return output_tensor
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 from nerf_experiments.source.config.config_utils import load_yaml_config, parse_nerf_config
-from nerf_experiments.source.config.runtime_config import to_runtime_train_config
+from nerf_experiments.source.config.runtime_config import load_configs_with_extras
 
 
 def main():
@@ -36,6 +36,9 @@ def main():
                     help="Override train.val_every (accepts 1k, 500, etc).")
     ap.add_argument("--val_frame_idx", type=int, default=0,
                     help="Which frame index to render during validation previews.")
+    ap.add_argument("--eval-chunk", type=int, default=None,
+                    help="Rays per forward pass during validation/path rendering (default 8192). "
+                         "Lower if you hit CUDA OOM while validating.")
 
     # Render novel views
     ap.add_argument("--render_path", action="store_true", help="Render a novel camera path after training.")
@@ -78,6 +81,28 @@ def main():
     ap.add_argument("--thermal-throttle-sleep", type=float, default=5.0,
                     help="Brief sleep (seconds) after applying throttle, to let temps settle. Default: 5.0.")
 
+    # Validation video export controls
+    ap.add_argument("--val-video-glob", type=str, default=None,
+                    help="Glob (relative to the experiment folder) for validation frames, e.g. 'val/**/*.png'. "
+                         "If omitted, defaults to a sensible pattern.")
+    ap.add_argument("--val-video-out", type=str, default=None,
+                    help="Output filename for the validation video (relative to experiment folder). "
+                         "Defaults to 'val_video.mp4'.")
+    ap.add_argument("--val-video-fps", type=int, default=24,
+                    help="FPS for validation video (default: 24).")
+
+    # Run control / resume
+    ap.add_argument("--auto-resume", action="store_true",
+                    help="If set, automatically resume from latest checkpoint in the experiment folder.")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="Path to a checkpoint .pt to resume from (overrides --auto-resume if both are set).")
+    ap.add_argument("--resume-no-optim", action="store_true",
+                    help="When resuming, load model weights but NOT optimizer/scaler (fresh optimizer).")
+    ap.add_argument("--on-interrupt", choices=["none","save","render","render_and_exit"], default="render_and_exit",
+                    help="Behavior on Ctrl+C (SIGINT): just ignore (none), save checkpoint only (save), "
+                         "render videos only (render), or render and then exit (render_and_exit).")
+    ap.add_argument("--on-pause-signal", choices=["render","save_and_render"], default="render",
+                    help="Behavior on SIGUSR1 during training: render videos, or save checkpoint then render.")
 
     args = ap.parse_args()
 
@@ -85,62 +110,91 @@ def main():
     if args.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # Delay importing Trainer (which pulls in torch) until after env is set
+    # Delay importing Trainer (torch) until after env is set
     from nerf_experiments.source.train.trainer import Trainer
+    from nerf_experiments.source.config.runtime_config import load_configs_with_extras
 
-    # 1) Load YAML → sectioned config
-    ydict: Dict[str, Any] = load_yaml_config(args.config)
-    nerf_cfg = parse_nerf_config(ydict)
+    # 1) Compose output directory (keep as Path)
+    out_dir = Path(args.out_root) / args.exp_name
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2) Compose output directory
-    out_dir = str(Path(args.out_root) / args.exp_name)
+    # 2) EXTENDED overrides (core + new sections -> YAML-style namespaces)
+    overrides = {
+        # core
+        "data.root": args.data_root,
+        "train.out_dir": str(out_dir),
+        "train.device": args.device,
+        "train.max_steps": args.max_steps,
+        "train.rays_per_batch": args.rays_per_batch,
+        "train.val_every": args.val_every_steps,
+        "eval.eval_chunk": args.eval_chunk,
+        # memory / perf
+        "memory.micro_chunks": args.micro_chunks,
+        "memory.ckpt_mlp": args.ckpt_mlps if hasattr(args, "ckpt_mlps") else args.ckpt_mlp,  # keep args.ckpt_mlp
+        "memory.cuda_expandable_segments": args.cuda_expandable_segments,
+        # logging / TB
+        "logging.tensorboard": args.tensorboard,
+        "logging.tb_logdir": args.tb_logdir,
+        "logging.tb_group_root": getattr(args, "tb_group_root", None),
+        # safety / thermals
+        "safety.thermal_throttle": args.thermal_throttle,
+        "safety.thermal_throttle_max_micro": args.thermal_throttle_max_micro,
+        "safety.thermal_throttle_sleep": args.thermal_throttle_sleep,
+        "safety.gpu_temp_threshold": args.gpu_temp_threshold,
+        "safety.gpu_temp_check_every": args.gpu_temp_check_every,
+        # path render controls
+        "path.render_path": args.render_path,
+        "path.path_type": args.path_type,
+        "path.path_frames": args.path_frames,
+        "path.path_fps": args.path_fps,
+        "path.path_res_scale": args.path_res_scale,
+        # validation video (if you wired these into extras; otherwise leave as direct setattrs later)
+        "logging.val_video_glob": args.val_video_glob,
+        "logging.val_video_out": args.val_video_out,
+        "logging.val_video_fps": args.val_video_fps,
+    }
+    # prune unset values (None)
+    overrides = {k: v for k, v in overrides.items() if v is not None}
 
-    # 3) CLI overrides (dot-paths)
-    overrides: Dict[str, Any] = {"train.out_dir": out_dir}
-    if args.data_root is not None:        overrides["data.root"] = args.data_root
-    if args.device is not None:           overrides["train.device"] = args.device
-    if args.seed is not None:             overrides["seed"] = args.seed
-    if args.max_steps is not None:        overrides["train.max_steps"] = args.max_steps
-    if args.rays_per_batch is not None:   overrides["train.rays_per_batch"] = args.rays_per_batch
-    if args.val_every_steps is not None:  overrides["train.val_every"] = args.val_every_steps
-
-    # 4) Freeze → runtime config; save resolved + original in out_dir
-    rt_cfg = to_runtime_train_config(
-        nerf_cfg,
+    # 3) Load frozen runtime config + EXTRAS (TB/thermals/eval/path/etc.)
+    rt_cfg, extras, _ = load_configs_with_extras(
+        yaml_path=args.config,
         cli_overrides=overrides,
         save_dir=out_dir,
-        original_yaml=ydict,
     )
 
-    # 5) Train
-    trainer = Trainer(
-        cfg=rt_cfg,
-        use_tb=bool(args.tensorboard),
-        tb_logdir=args.tb_logdir,
-        tb_group_root=args.tb_group_root
-    )
+    # 4) Build trainer (no TB args in constructor)
+    trainer = Trainer(cfg=rt_cfg)
 
-    # pass runtime toggles for memory behavior
-    setattr(trainer, "micro_chunks", int(max(0, args.micro_chunks)))
-    setattr(trainer, "ckpt_mlp", bool(args.ckpt_mlp))
-    # tensorboard toggles
-    setattr(trainer, "use_tb", bool(args.tensorboard))
-    setattr(trainer, "tb_logdir", args.tb_logdir)
-    # thermal toggles
-    setattr(trainer, "gpu_temp_threshold", int(args.gpu_temp_threshold))
-    setattr(trainer, "gpu_temp_check_every", int(max(1, args.gpu_temp_check_every)))
-    setattr(trainer, "gpu_cooldown_seconds", int(max(0, args.gpu_cooldown_seconds)))
-    setattr(trainer, "thermal_throttle", bool(args.thermal_throttle))
-    setattr(trainer, "thermal_throttle_max_micro", int(max(1, args.thermal_throttle_max_micro)))
-    setattr(trainer, "thermal_throttle_sleep", float(max(0.0, args.thermal_throttle_sleep)))
-    # set which frame to validate (Trainer uses this attr if present)
+    # 5) Apply EXTRAS from YAML/CLI namespaces
+    for k, v in (extras or {}).items():
+        if v is not None:
+            setattr(trainer, k, v)
+
+    # 6) CLI-only flags that are not part of extras
+    setattr(trainer, "auto_resume", bool(args.auto_resume))
+    setattr(trainer, "resume_path", args.resume)
+    setattr(trainer, "resume_no_optim", bool(getattr(args, "resume_no_optim", False)))
+    setattr(trainer, "on_interrupt", getattr(args, "on_interrupt", "render_and_exit"))
+    setattr(trainer, "on_pause_signal", getattr(args, "on_pause_signal", "render"))
     setattr(trainer, "val_frame_idx", int(args.val_frame_idx))
+    # (If val-video settings weren’t mapped into extras, set them directly:)
+    if getattr(trainer, "val_video_glob", None) is None:
+        setattr(trainer, "val_video_glob", args.val_video_glob)
+    if getattr(trainer, "val_video_out", None) is None:
+        setattr(trainer, "val_video_out", args.val_video_out)
+    if getattr(trainer, "val_video_fps", None) is None:
+        setattr(trainer, "val_video_fps", int(args.val_video_fps))
 
+    # 7) Initialize TensorBoard AFTER attributes are final
+    trainer.maybe_init_tensorboard()
+
+    # 8) Train
     trainer.train()
 
-    # 6) Render video
+    # 9) Optional: render novel path after training
     if args.render_path:
-        path_out = Path(out_dir) / "render_path"
+        path_out = out_dir / "render_path"
         trainer.render_camera_path(
             out_dir=path_out,
             n_frames=args.path_frames,

@@ -50,6 +50,11 @@ class CameraConfig:
     model: str = "pinhole"                # 'opencv' if you use distortion
 
 @dataclass
+class ModelConfig:
+    init_acc: float = 0.05   # initial accumulated opacity
+    # ... maybe also hidden_dim, n_layers, etc.
+
+@dataclass
 class TrainSection:
     device: str = "cuda"
     rays_per_batch: int = 4096
@@ -85,6 +90,7 @@ class EncodingConfig:
 class NerfConfig:
     data: DataConfig = field(default_factory=DataConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainSection = field(default_factory=TrainSection)
     render: RenderConfig = field(default_factory=RenderConfig)
     encoding: EncodingConfig = field(default_factory=EncodingConfig)
@@ -120,6 +126,7 @@ def parse_nerf_config(yaml_cfg: dict) -> NerfConfig:
     # Pull sections (user may omit some)
     data = _merge_defaults(DataConfig().__dict__, yaml_cfg.get("data", {}))
     camera = _merge_defaults(CameraConfig().__dict__, yaml_cfg.get("camera", {}))
+    model = _merge_defaults(ModelConfig().__dict__, yaml_cfg.get("model", {}))
     train = _merge_defaults(TrainSection().__dict__, yaml_cfg.get("train", {}))
     render = _merge_defaults(RenderConfig().__dict__, yaml_cfg.get("render", {}))
     enc_user = yaml_cfg.get("encoding", {})
@@ -148,6 +155,9 @@ def parse_nerf_config(yaml_cfg: dict) -> NerfConfig:
         near=float(camera["near"]),
         far=float(camera["far"]),
         model=str(camera["model"]),
+    )
+    md = ModelConfig(
+        init_acc=float(model["init_acc"])
     )
     tr = TrainSection(
         device=str(train["device"]) if "device" in train else "cuda",
@@ -178,47 +188,46 @@ def parse_nerf_config(yaml_cfg: dict) -> NerfConfig:
         ),
     )
 
-    cfg = NerfConfig(data=dc, camera=cc, train=tr, render=rc, encoding=ec)
+    cfg = NerfConfig(data=dc, camera=cc, model=md, train=tr, render=rc, encoding=ec)
     cfg.validate()
     return cfg
 
+# NEW: extract optional sections into a plain dict for Trainer “extras”
+def parse_extras(yaml_cfg: dict) -> dict:
+    def _get(d, path, default=None):
+        cur = d
+        for k in path.split("."):
+            if not isinstance(cur, dict) or k not in cur:
+                return default
+            cur = cur[k]
+        return cur
 
-# ---------- Adapter: NerfConfig -> Trainer.TrainConfig ----------
-
-# Import here (or move this into trainer.py) to avoid circulars
-try:
-    from trainer import TrainConfig as RuntimeTrainConfig
-except Exception:
-    RuntimeTrainConfig = None  # if trainer not imported yet
-
-def to_runtime_train_config(cfg: NerfConfig) -> "RuntimeTrainConfig":
-    """
-    Convert a NerfConfig (sectioned) into the flat TrainConfig used by Trainer.
-    """
-    if RuntimeTrainConfig is None:
-        raise RuntimeError("RuntimeTrainConfig unavailable; import trainer.TrainConfig first.")
-
-    return RuntimeTrainConfig(
-        data_root=cfg.data.root,
-        split=cfg.data.split,
-        downscale=cfg.data.downscale,
-        white_bg=cfg.data.white_bg,
-        device=cfg.train.device,
-        rays_per_batch=cfg.train.rays_per_batch,
-        nc=cfg.render.Nc,
-        nf=cfg.render.Nf,
-        det_fine=cfg.render.det_fine,
-        jitter=True,  # you can expose this later if needed
-        pos_freqs=cfg.encoding.pos.num_freqs,
-        dir_freqs=cfg.encoding.dir.num_freqs,
-        include_input=cfg.encoding.pos.include_input,  # keep pos/dir consistent for now
-        lr=cfg.train.lr,
-        max_steps=cfg.train.max_steps,
-        log_every=cfg.train.log_every,
-        val_every=cfg.train.val_every,
-        ckpt_every=cfg.train.ckpt_every,
-        amp=cfg.train.amp,
-        out_dir=cfg.train.out_dir,
-        near_override=cfg.camera.near,
-        far_override=cfg.camera.far,
-    )
+    extras = {}
+    # eval
+    extras["eval_nc"] = _parse_int_like(_get(yaml_cfg, "eval.eval_nc", 0)) or None
+    extras["eval_nf"] = _parse_int_like(_get(yaml_cfg, "eval.eval_nf", 0)) or None
+    extras["eval_chunk"] = _parse_int_like(_get(yaml_cfg, "eval.eval_chunk", 0)) or None
+    # memory
+    extras["micro_chunks"] = _parse_int_like(_get(yaml_cfg, "memory.micro_chunks", 0)) or None
+    extras["ckpt_mlp"] = bool(_get(yaml_cfg, "memory.ckpt_mlp", False))
+    extras["cuda_expandable_segments"] = bool(_get(yaml_cfg, "memory.cuda_expandable_segments", False))
+    # logging
+    extras["use_tb"] = bool(_get(yaml_cfg, "logging.tensorboard", False))
+    extras["tb_logdir"] = _get(yaml_cfg, "logging.tb_logdir", None)
+    extras["tb_group_root"] = _get(yaml_cfg, "logging.tb_group_root", None)
+    # safety
+    extras["thermal_throttle"] = bool(_get(yaml_cfg, "safety.thermal_throttle", False))
+    extras["thermal_throttle_max_micro"] = _parse_int_like(_get(yaml_cfg, "safety.thermal_throttle_max_micro", 0)) or None
+    extras["thermal_throttle_sleep"] = float(_get(yaml_cfg, "safety.thermal_throttle_sleep", 0.0) or 0.0)
+    extras["gpu_temp_threshold"] = _parse_int_like(_get(yaml_cfg, "safety.gpu_temp_threshold", 0)) or None
+    extras["gpu_temp_check_every"] = _parse_int_like(_get(yaml_cfg, "safety.gpu_temp_check_every", 0)) or None
+    # path render
+    extras["render_path"] = bool(_get(yaml_cfg, "path.render_path", False))
+    extras["path_type"] = _get(yaml_cfg, "path.path_type", None)
+    extras["path_frames"] = _parse_int_like(_get(yaml_cfg, "path.path_frames", 0)) or None
+    extras["path_fps"] = _parse_int_like(_get(yaml_cfg, "path.path_fps", 0)) or None
+    extras["path_res_scale"] = float(_get(yaml_cfg, "path.path_res_scale", 0.0) or 0.0) or None
+    # color
+    extras["targets_are_srgb"] = bool(_get(yaml_cfg, "color.targets_are_srgb", True))
+    extras["sigma_noise_std"] = float(_get(yaml_cfg, "color.sigma_noise_std", 1e-3))
+    return extras

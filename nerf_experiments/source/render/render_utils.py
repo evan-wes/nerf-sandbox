@@ -8,7 +8,7 @@ def volume_render_rays(
     z_depths: torch.Tensor,
     white_bkgd: bool = False,
     eps: float = 1e-10
-) -> tuple[torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Uses the MLP output of RGB and volume density at sampled depths along a batch of rays to
     render the composited RGB values, along with other semantically meaningful outputs used
@@ -35,7 +35,7 @@ def volume_render_rays(
     -------
     composite_rgb : torch.Tensor
         The rendered color for each ray after integrating the MLP-predicted color and volume
-        densities along the rays at the sampled depths. Has shape (num_rays, num_ray_pts, 3).
+        densities along the rays at the sampled depths. Has shape (num_rays, 3).
     weights : torch.Tensor
         Probability of a ray terminating at a volume element. Used for re-sampling new positions
         along the rays. Has shape (num_rays, num_ray_pts).
@@ -47,11 +47,15 @@ def volume_render_rays(
 
     # Step 1. Compute integration bins
     deltas = z_depths[..., 1:] - z_depths[..., :-1] # shape (num_rays, num_ray_pts-1)
-    # Add a large final bin
-    deltas = torch.cat([deltas, 1e10 * torch.ones_like(deltas[..., :1])], dim=-1)   # shape (num_rays, num_ray_pts)
+    # # Add a large final bin
+    # deltas = torch.cat([deltas, 1e10 * torch.ones_like(deltas[..., :1])], dim=-1)   # shape (num_rays, num_ray_pts)
+    # Finite bins only; let any remaining transmittance go to the background term (1-acc)
+    deltas = z_depths[..., 1:] - z_depths[..., :-1]                      # [B, N-1]
+    deltas = torch.cat([deltas, torch.zeros_like(deltas[..., :1])], -1)  # [B, N]
 
     # Step 2. Compute opacities at each sample point
-    alphas = 1.0 - torch.exp(-sigma * deltas).clamp_min(0.0) # shape (num_rays, num_ray_pts)
+    alphas = 1.0 - torch.exp(-sigma * deltas)
+    alphas = alphas.clamp(0.0, 1.0) # shape (num_rays, num_ray_pts)
 
     # Step 3. Compute transmittance as a cumulative product over (1 - alpha)
     shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1.0 - alphas + eps], dim=-1)
@@ -61,7 +65,9 @@ def volume_render_rays(
     # the accumulated opacity as the sum of the weights, and the depths as the sum of
     # the weighted sample points normalized by the accumulated opacity
     weights = transmittance * alphas    # shape (num_rays, num_ray_pts)
-    accumulated_opacity = weights.sum(dim=-1)    # shape (num_rays)
+    weights = weights.clamp_min(0.0)
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    accumulated_opacity = weights.sum(dim=-1).clamp(0.0, 1.0)    # shape (num_rays)
     depths = (weights * z_depths).sum(dim=-1) / (accumulated_opacity + eps)  # shape (num_rays)
 
     # Step 5. Compute the composite color as the weighted sum of the MLP-predicted RGB color

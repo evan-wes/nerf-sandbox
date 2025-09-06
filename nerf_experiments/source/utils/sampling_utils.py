@@ -37,6 +37,10 @@ def sample_pdf(
     # Avoid zeros in demonminators by adding a small epsilon to the input weights
     epsilon = 1e-5
     weights = weights + epsilon
+    weights_sum = weights.sum(dim=-1, keepdim=True)
+    # If sum is still ~0 (all near-zero), fall back to uniform
+    use_uniform_samples = (weights_sum <= 1e-6)
+    weights = torch.where(use_uniform_samples, torch.ones_like(weights), weights)
 
     # Create the probability density function by normalizing the weights
     pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
@@ -54,6 +58,7 @@ def sample_pdf(
     else:
         # Create a random set of points between 0 to 1 with shape (num_rays, n_samples)
         u = torch.rand(*cdf.shape[:-1], n_samples, device=device) # shape (num_rays, n_samples)
+    u = u.clamp(0.0, 1.0 - 1e-8)
 
 
     # Get the positions in the CDF that bracket each of the sampled points between 0 and 1
@@ -74,5 +79,16 @@ def sample_pdf(
     denominator = (cdf_values[..., 1] - cdf_values[..., 0]).clamp(min=epsilon)
     t = (u - cdf_values[..., 0])/denominator
     samples = bins_values[..., 0] + t * (bins_values[..., 1] - bins_values[..., 0]) # shape (num_rays, n_samples)
+
+    # If uniform fallback case, just stratified uniform within [bins.min, bins.max]
+    if use_uniform_samples.any():
+        low = bins[:, :1]
+        high = bins[:, -1:]
+        if deterministic:
+            u2 = torch.linspace(0.0, 1.0, n_samples, device=bins.device, dtype=bins.dtype).unsqueeze(0).expand_as(samples)
+        else:
+            u2 = torch.rand_like(samples)
+        uniform = low + (high - low) * u2
+        samples = torch.where(use_uniform_samples, uniform, samples)
 
     return samples

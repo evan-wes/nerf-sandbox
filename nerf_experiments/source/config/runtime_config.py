@@ -4,6 +4,7 @@ Contains the RuntimeTrainConfig dataclass meant to be a stable interface for the
 
 
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import dataclass, asdict, replace, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -12,7 +13,7 @@ import warnings
 import yaml
 
 # Import your sectioned config
-from nerf_experiments.source.config.config_utils import NerfConfig, _parse_int_like
+from nerf_experiments.source.config.config_utils import NerfConfig, _parse_int_like, parse_nerf_config, load_yaml_config, parse_extras
 
 
 # -----------------------------
@@ -28,6 +29,9 @@ class RuntimeTrainConfig:
     ndc: bool
     near: float
     far: float
+
+    # Model init
+    init_acc: float
 
     # Device / IO
     device: str
@@ -119,6 +123,7 @@ def _apply_overrides_copy(cfg: NerfConfig, overrides: Dict[str, Any]) -> NerfCon
     base = {
         "data": _asdict_dc(cfg.data),
         "camera": _asdict_dc(cfg.camera),
+        "model": _asdict_dc(cfg.model),
         "train": _asdict_dc(cfg.train),
         "render": _asdict_dc(cfg.render),
         "encoding": {
@@ -155,6 +160,7 @@ def _apply_overrides_copy(cfg: NerfConfig, overrides: Dict[str, Any]) -> NerfCon
     new_cfg = NerfConfig(
         data=cfg.data.__class__(**base["data"]),
         camera=cfg.camera.__class__(**base["camera"]),
+        model=cfg.model.__class__(**base["model"]),
         train=cfg.train.__class__(**base["train"]),
         render=cfg.render.__class__(**base["render"]),
         encoding=cfg.encoding.__class__(
@@ -232,6 +238,9 @@ def to_runtime_train_config(
         near=float(cfg2.camera.near),
         far=float(cfg2.camera.far),
 
+        # Model init
+        init_acc=float(cfg2.model.init_acc),
+
         # Device / IO
         device=str(cfg2.train.device),
         out_dir=str(cfg2.train.out_dir),
@@ -267,3 +276,49 @@ def to_runtime_train_config(
         save_resolved_config(rt, save_dir, original_yaml=original_yaml)
 
     return rt
+
+# NEW: end-to-end loader that returns both the frozen runtime config and a dict of extras
+def load_configs_with_extras(yaml_path: str | Path,
+                             cli_overrides: Optional[Dict[str, Any]],
+                             save_dir: Optional[str | Path] = None):
+    """
+    Load YAML, apply CLI dot-path overrides, return (RuntimeTrainConfig, extras, original_yaml_dict).
+    `extras` contains optional features (tensorboard, micro-chunks, eval samples, thermal guard, etc.).
+    """
+    original_yaml = load_yaml_config(yaml_path)
+    # parse -> dataclasses
+    base_cfg = parse_nerf_config(original_yaml)
+    # Split overrides: core vs extras
+    core_prefixes = ("data.", "train.", "camera.", "model.", "render.", "encoding.")
+    cli_overrides = cli_overrides or {}
+    core_overrides   = {k: v for k, v in cli_overrides.items() if k.startswith(core_prefixes)}
+    extras_overrides = {k: v for k, v in cli_overrides.items() if k not in core_overrides}
+
+    # Build runtime (frozen core) with core overrides only
+    rt = to_runtime_train_config(base_cfg,
+                                 cli_overrides=core_overrides,
+                                 save_dir=save_dir,
+                                 original_yaml=original_yaml)
+
+    # Apply BOTH core+extras overrides to a YAML dict copy, then parse extras from that
+    patched = deepcopy(original_yaml)
+    def _set(d, dot, v):
+        cur = d; parts = dot.split(".")
+        for p in parts[:-1]:
+            if not isinstance(cur, dict) or p not in cur:
+                return
+            cur = cur[p]
+        # create leaf if missing (extras may not exist yet)
+        if isinstance(cur, dict):
+            cur[parts[-1]] = v
+    for k, v in {**core_overrides, **extras_overrides}.items():
+        # normalize some int-like values commonly passed as strings
+        if any(k.endswith(suf) for suf in ("eval_nc","eval_nf","micro_chunks",
+                                           "thermal_throttle_max_micro","gpu_temp_threshold",
+                                           "gpu_temp_check_every","path_frames","path_fps")):
+            try: v = _parse_int_like(v)
+            except: pass
+        _set(patched, k, v)
+    extras = parse_extras(patched)
+    return rt, extras, original_yaml
+
