@@ -71,7 +71,7 @@ class Scene:
 
     Attributes:
         frames:   List of calibrated views.
-        white_bg: Whether to composite on white background during rendering.
+        white_bkgd: Whether to composite on white background during rendering.
         aabb:     Optional axis-aligned bounding box [xmin, ymin, zmin, xmax, ymax, zmax]
                   in world coordinates for normalization / near-far estimation.
         near:     Default near bound (world units). Can be overridden per-call.
@@ -80,7 +80,7 @@ class Scene:
         origin:   Optional world translation applied to all frames (for centering).
     """
     frames: List[Frame]
-    white_bg: bool = True
+    white_bkgd: bool = True
     aabb: Optional[Tuple[float, float, float, float, float, float]] = None
     near: Optional[float] = None
     far: Optional[float] = None
@@ -90,7 +90,7 @@ class Scene:
     def to_torch(self, device: Optional[Union[str, torch.device]] = None) -> "Scene":
         return Scene(
             frames=[f.to_torch(device) for f in self.frames],
-            white_bg=self.white_bg,
+            white_bkgd=self.white_bkgd,
             aabb=self.aabb,
             near=self.near,
             far=self.far,

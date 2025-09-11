@@ -1,148 +1,190 @@
 """
-Contains the RayBatch, RaySampler and RandomPixelRaySampler classes
-for sampling ray batches from images
-
-Key abstractions:
-- RaySampler: yields training batches of rays and ground-truth targets
-- Renderer: interface for coarse→fine NeRF rendering (implementation later)
+Ray samplers for training:
+- RandomPixelRaySampler: uniform over all frames
+- GoldRandomPixelRaySampler: vanilla NeRF style (single image per step + precrop)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, Iterator, List, Literal, Optional, Tuple, Union
-import numpy as np
+import random
+from typing import Iterator, Dict, Optional
+
 import torch
 
-from nerf_experiments.source.data.scene import Frame, Scene
-from nerf_experiments.source.utils.ray_utils import get_camera_rays
+from nerf_experiments.source.utils.render_utils import get_camera_rays
 
 
-class RayBatch(Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]):
-    """Type hint: (rays_o [B,3], rays_d [B,3], rgb [B,3], mask [B,1] or None)."""
-    pass
+# Minimal protocol Scene/Frame:
+# scene.frames[i].image: np.ndarray (H,W,3 or 4) in [0,1]
+# scene.frames[i].K: (3,3) float
+# scene.frames[i].c2w: (4,4) float
+# scene.white_bkgd: bool
+
 
 class RaySampler:
-    """Abstract ray sampler.
-
-    Implementations yield dictionaries or tuples containing per-ray batches.
-    """
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        raise NotImplementedError
-
-    def next_batch(self) -> Dict[str, torch.Tensor]:
-        """Optionally provide an explicit pull API."""
-        return next(iter(self))
+    pass
 
 
 class RandomPixelRaySampler(RaySampler):
-    """Uniformly sample rays by picking random (image, y, x) coordinates.
-
-    This is robust across datasets and easy to extend with masks/weights.
     """
-    def __init__(
-        self,
-        scene: Scene,
-        rays_per_batch: int = 2048,
-        device: str | torch.device | None = None,
-        white_bg_composite: bool | None = None,
-        cache_images_on_device: bool = False,
-    ):
-        self.scene = scene.to_torch(device)
+    Configurable pixel-ray sampler for NeRF training.
+
+    Modes
+    -----
+    - Mixed-frames mode (default): sample pixels uniformly across all frames; each
+      batch mixes multiple images.
+    - Single-frame mode (vanilla NeRF style): sample all rays for the batch from
+      a single randomly-chosen frame.
+
+    Precrop
+    -------
+    Optionally apply a center crop during the first `precrop_iters` steps. This
+    affects the candidate pixel region in either mode.
+
+    Parameters
+    ----------
+    scene : Scene
+        Scene containing frames with (image, K, c2w).
+    rays_per_batch : int
+        Number of rays/pixels per yielded batch.
+    device : str | torch.device | None
+        Device where cached tensors/rays are placed. If None, stays on CPU.
+    white_bg_composite : bool | None
+        If True, composite RGBA onto white on the fly; if None, uses scene.white_bkgd.
+    cache_images_on_device : bool
+        Kept for signature parity; images are turned into tensors on `device` either way.
+    sample_from_single_frame : bool
+        If True, sample a single random frame per batch (vanilla NeRF style).
+        If False, mix frames within a batch uniformly (default).
+    precrop_iters : int
+        Number of initial iterations to use center precropping.
+    precrop_frac : float
+        Fraction of the image side length used for the center crop (0<frac<=1).
+    """
+
+    def __init__(self,
+                 scene,
+                 rays_per_batch: int = 2048,
+                 device: str | torch.device | None = None,
+                 white_bg_composite: Optional[bool] = None,
+                 cache_images_on_device: bool = False,
+                 sample_from_single_frame: bool = False,
+                 precrop_iters: int = 0,
+                 precrop_frac: float = 0.5) -> None:
+
+        self.scene = scene
         self.B = int(rays_per_batch)
         self.device = torch.device(device) if device is not None else None
-        self.white_bg = self.scene.white_bg if white_bg_composite is None else white_bg_composite
-        self.cache_images_on_device = cache_images_on_device
+        self.white_bkgd = scene.white_bkgd if white_bg_composite is None else bool(white_bg_composite)
+        self.cache = bool(cache_images_on_device)
 
-        # Cache per-frame tensors on device for fast indexing
+        # Sampling behavior toggles
+        self.sample_from_single_frame = bool(sample_from_single_frame)
+        self.precrop_iters = int(precrop_iters)
+        self.precrop_frac = float(precrop_frac)
+        self._global_step = 0  # incremented per yielded batch
+
+        # Cache per-frame tensors (images, intrinsics, extrinsics)
         self._Ks = []
         self._c2ws = []
         self._imgs = []
         for f in self.scene.frames:
-            # Ensure float32 torch tensors on device
-            Kt = torch.as_tensor(f.K, dtype=torch.float32, device=self.device)
-            Tt = torch.as_tensor(f.c2w, dtype=torch.float32, device=self.device)
-            It = torch.as_tensor(f.image, dtype=torch.float32, device=self.device)  # [H,W,3|4] in [0,1]
-            self._Ks.append(Kt)
-            self._c2ws.append(Tt)
-            self._imgs.append(It)
+            self._Ks.append(torch.as_tensor(f.K, dtype=torch.float32, device=self.device))
+            self._c2ws.append(torch.as_tensor(f.c2w, dtype=torch.float32, device=self.device))
+            img = torch.as_tensor(f.image, dtype=torch.float32, device=self.device)
+            self._imgs.append(img)
 
+        # Assume consistent resolution across frames
         self.H = self.scene.frames[0].image.shape[0]
         self.W = self.scene.frames[0].image.shape[1]
 
-    def __iter__(self):
-        rng = np.random.default_rng()
+    def _current_crop_bounds(self) -> tuple[int, int, int, int]:
+        """
+        Compute (h0, h1, w0, w1) for the current iteration based on precropping.
+        Full-frame if precrop_iters exhausted or disabled.
+        """
         H, W = self.H, self.W
-        device = self.device
+        if self._global_step < self.precrop_iters and 0.0 < self.precrop_frac < 1.0:
+            f = self.precrop_frac
+            h0 = int(H * 0.5 * (1.0 - f))
+            h1 = int(H * 0.5 * (1.0 + f))
+            w0 = int(W * 0.5 * (1.0 - f))
+            w1 = int(W * 0.5 * (1.0 + f))
+        else:
+            h0, h1, w0, w1 = 0, H, 0, W
+        return h0, h1, w0, w1
+
+    def _composite_rgb(self, pix: torch.Tensor) -> torch.Tensor:
+        """
+        Composite RGBA onto white if requested; otherwise return RGB as-is.
+        pix: (..., C) where C is 3 or 4.
+        """
+        if self.white_bkgd and pix.shape[-1] == 4:
+            return pix[..., :3] * pix[..., 3:4] + (1.0 - pix[..., 3:4])
+        return pix[..., :3]
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        num_frames = len(self._imgs)
 
         while True:
-            # 1) Sample B (frame, y, x) tuples
-            img_idx = torch.from_numpy(rng.integers(0, len(self._imgs), size=self.B)).to(device)
-            ys = torch.from_numpy(rng.integers(0, H, size=self.B)).to(device)
-            xs = torch.from_numpy(rng.integers(0, W, size=self.B)).to(device)
+            h0, h1, w0, w1 = self._current_crop_bounds()
 
-            # 2) Group by unique frame to avoid per-pixel loops
-            uniq_imgs, inverse = torch.unique(img_idx, sorted=False, return_inverse=True)
+            if self.sample_from_single_frame:
+                # -------- Single-frame mode (vanilla NeRF) --------
+                frame_id = random.randrange(num_frames)
+                K = self._Ks[frame_id]
+                c2w = self._c2ws[frame_id]
+                img = self._imgs[frame_id]
 
-            rays_o_chunks = []
-            rays_d_chunks = []
-            rgb_chunks = []
+                # Sample pixel coordinates within the (possibly cropped) region
+                ys = torch.randint(h0, h1, (self.B,), device=self.device)
+                xs = torch.randint(w0, w1, (self.B,), device=self.device)
 
-            for ui, img_id in enumerate(uniq_imgs.tolist()):
-                # Select all pixels in this batch that come from the same frame
-                mask = (inverse == ui)
-                xs_i = xs[mask]
-                ys_i = ys[mask]
-                n_i  = xs_i.numel()
-                if n_i == 0:
-                    continue
+                # Build rays for this frame
+                pixels_xy = torch.stack([xs.to(torch.float32), ys.to(torch.float32)], dim=-1)
+                rays_o, rays_d = get_camera_rays(self.H, self.W, K, c2w,
+                                                 device=self.device, pixels_xy=pixels_xy)
 
-                # Gather intrinsics, pose, and image for this frame
-                K = self._Ks[img_id]      # [3,3]
-                T = self._c2ws[img_id]    # [4,4] or [3,4]
-                I = self._imgs[img_id]    # [H,W,3|4], float32 in [0,1]
+                # Gather RGB targets (composite if RGBA and white_bkgd)
+                pix = img[ys.long(), xs.long()]
+                rgb = self._composite_rgb(pix)
 
-                # 3) Build rays for all pixels of this frame in one call
-                pixels_xy = torch.stack([xs_i.to(torch.float32), ys_i.to(torch.float32)], dim=-1)  # [n_i,2]
-                rays_o_i, rays_d_i = get_camera_rays(
-                    image_h=H,
-                    image_w=W,
-                    intrinsic_matrix=K,
-                    transform_camera_to_world=T,
-                    device=device,
-                    dtype=torch.float32,
-                    normalize_dirs=True,
-                    as_ndc=False,
-                    near_plane=1.0,
-                    pixels_xy=pixels_xy,
-                )  # each [n_i,3]
+                batch = {"rays_o": rays_o, "rays_d": rays_d, "rgb": rgb}
 
-                # 4) Vectorized pixel gather (+ optional white background compositing)
-                # Advanced indexing supports (y,x) lists directly
-                pix = I[ys_i.long(), xs_i.long()]  # [n_i, C], C=3 or 4
-                if self.white_bg and pix.shape[-1] == 4:
-                    rgb_i = pix[..., :3] * pix[..., 3:4] + (1.0 - pix[..., 3:4])
-                else:
-                    rgb_i = pix[..., :3]
+            else:
+                # -------- Mixed-frames mode (uniform across all frames) --------
+                # Sample coordinates & frame indices independently
+                ys = torch.randint(h0, h1, (self.B,), device=self.device)
+                xs = torch.randint(w0, w1, (self.B,), device=self.device)
+                frame_ids = torch.randint(0, num_frames, (self.B,), device=self.device)
 
-                rays_o_chunks.append(rays_o_i)
-                rays_d_chunks.append(rays_d_i)
-                rgb_chunks.append(rgb_i)
+                rays_o_list = []
+                rays_d_list = []
+                rgb_list = []
 
-            # 5) Concatenate chunks back to [B,3] in the original sample order
-            # We built per-unique-frame chunks in arbitrary order; reassemble to match (img_idx, xs, ys) order
-            # Build an output buffer and fill it:
-            rays_o = torch.empty(self.B, 3, dtype=torch.float32, device=device)
-            rays_d = torch.empty(self.B, 3, dtype=torch.float32, device=device)
-            rgbs   = torch.empty(self.B, 3, dtype=torch.float32, device=device)
+                # Build rays per unique frame to avoid recomputing K/c2w per pixel
+                for fid in frame_ids.unique().tolist():
+                    mask = (frame_ids == fid)
+                    K = self._Ks[fid]
+                    c2w = self._c2ws[fid]
+                    img = self._imgs[fid]
 
-            # Compute start offsets per unique group to place chunks contiguously
-            # Build an index list for each group
-            group_positions = [torch.nonzero(inverse == g, as_tuple=False).flatten() for g in range(len(uniq_imgs))]
-            # Now scatter each chunk into its positions
-            for pos, ro, rd, c in zip(group_positions, rays_o_chunks, rays_d_chunks, rgb_chunks):
-                rays_o[pos] = ro
-                rays_d[pos] = rd
-                rgbs[pos]   = c
+                    px = torch.stack([xs[mask].to(torch.float32), ys[mask].to(torch.float32)], dim=-1)
+                    ro, rd = get_camera_rays(self.H, self.W, K, c2w,
+                                             device=self.device, pixels_xy=px)
 
-            yield {"rays_o": rays_o, "rays_d": rays_d, "rgb": rgbs}
+                    pix = img[ys[mask].long(), xs[mask].long()]
+                    rgb = self._composite_rgb(pix)
+
+                    rays_o_list.append(ro)
+                    rays_d_list.append(rd)
+                    rgb_list.append(rgb)
+
+                batch = {
+                    "rays_o": torch.cat(rays_o_list, dim=0),
+                    "rays_d": torch.cat(rays_d_list, dim=0),
+                    "rgb":   torch.cat(rgb_list,   dim=0),
+                }
+
+            self._global_step += 1
+            yield batch

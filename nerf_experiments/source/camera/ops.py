@@ -1,1 +1,0 @@
-"""Contains utilities for operations with camera models and rays"""

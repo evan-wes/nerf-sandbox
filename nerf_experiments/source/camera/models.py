@@ -1,1 +1,0 @@
-"""Contains different models of cameras"""

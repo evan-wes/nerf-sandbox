@@ -1,212 +1,248 @@
 """
+Minimal training / render script for the refactored Trainer.
 
+Adds:
+  --render_only            -> skip training; just load a checkpoint and render a camera path
+  --resume {latest|PATH}   -> choose which checkpoint to load (works with/without --render_only)
 """
 
 from __future__ import annotations
+
 import argparse
-import os
+from types import SimpleNamespace
 from pathlib import Path
-from typing import Dict, Any
 
-from nerf_experiments.source.config.config_utils import load_yaml_config, parse_nerf_config
-from nerf_experiments.source.config.runtime_config import load_configs_with_extras
+from nerf_experiments.source.train.trainer import Trainer
+from nerf_experiments.source.utils.validation_renderer import ValidationRenderer
 
 
-def main():
-    ap = argparse.ArgumentParser("NeRF trainer")
-    ap.add_argument("--config", type=str, required=True,
-                    help="Path to YAML config (NerfConfig schema).")
-    ap.add_argument("--data_root", type=str, default=None,
-                    help="Override data.root from YAML (e.g. /local_dir/nerf_synthetic/lego).")
-    ap.add_argument("--exp_name", type=str, default="exp",
-                    help="Experiment name (used to create output dir).")
-    ap.add_argument("--out_root", type=str, default="runs",
-                    help="Root folder for outputs; final out_dir = out_root/exp_name.")
-    ap.add_argument("--device", type=str, default=None,
-                    help="Optional device override, e.g. cuda, cuda:0, or cpu.")
-    ap.add_argument("--seed", type=int, default=None,
-                    help="Optional random seed override.")
-    ap.add_argument("--max_steps", type=str, default=None,
-                    help="Override train.max_steps (accepts 200k, 5k, etc).")
-    ap.add_argument("--rays_per_batch", type=str, default=None,
-                    help="Override train.rays_per_batch (accepts 4k, etc).")
+def make_cfg_from_args(args: argparse.Namespace) -> SimpleNamespace:
+    cfg = SimpleNamespace(**vars(args))
 
-    # Validation controls
-    ap.add_argument("--val_every_steps", type=str, default=None,
-                    help="Override train.val_every (accepts 1k, 500, etc).")
-    ap.add_argument("--val_frame_idx", type=int, default=0,
-                    help="Which frame index to render during validation previews.")
-    ap.add_argument("--eval-chunk", type=int, default=None,
-                    help="Rays per forward pass during validation/path rendering (default 8192). "
-                         "Lower if you hit CUDA OOM while validating.")
+    # One-switch: bmild/vanilla parity
+    if args.vanilla:
+        cfg.gold_nerf = True
+        cfg.white_bkgd = True
+        cfg.rays_per_batch = 1024
+        cfg.precrop_iters = 500
+        cfg.precrop_frac = 0.5
+        cfg.nc = 64
+        cfg.nf = 128
+        cfg.det_fine = False
+        cfg.pos_num_freqs = 10
+        cfg.dir_num_freqs = 4
+        cfg.pos_include_input = True
+        cfg.dir_include_input = True
+        cfg.n_layers = 8
+        cfg.hidden_dim = 256
+        cfg.skip_pos = 3
+        cfg.sigma_activation = "relu"
+        cfg.raw_noise_std = 1.0
+        cfg.near = 2.0
+        cfg.far = 6.0
+        cfg.lr = 5e-4
+    else:
+        cfg.gold_nerf = False
 
-    # Render novel views
-    ap.add_argument("--render_path", action="store_true", help="Render a novel camera path after training.")
-    ap.add_argument("--path_type", type=str, default="circle", choices=["circle", "spiral"])
+    # map --resume into existing fields
+    if args.resume:
+        if args.resume.lower() in ("latest", "auto"):
+            cfg.auto_resume = True
+            cfg.resume_path = None
+        else:
+            cfg.auto_resume = False
+            cfg.resume_path = args.resume
+
+    # Ensure eval defaults follow train unless explicitly set
+    cfg.eval_nc = args.eval_nc
+    cfg.eval_nf = args.eval_nf
+    cfg.eval_chunk = int(args.eval_chunk)
+    cfg.val_res_scale = float(args.val_res_scale)
+
+    Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser("Refactored NeRF Trainer / Renderer")
+
+    # Data
+    ap.add_argument("--data_root", type=str, required=True)
+    ap.add_argument("--split", type=str, default="train")
+    ap.add_argument("--downscale", type=int, default=1)
+    ap.add_argument("--white_bkgd", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+    ap.add_argument("--scene_scale", type=float, default=1.0)
+    ap.add_argument("--center_origin", action="store_true")
+    ap.add_argument("--composite_on_load", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+    ap.add_argument("--near", type=float, default=2.0)
+    ap.add_argument("--far", type=float, default=6.0)
+
+    # Output / Runtime
+    ap.add_argument("--out_dir", type=str, default="./exp")
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--amp", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+
+    # Model / Encoders
+    ap.add_argument("--pos_num_freqs", type=int, default=10)
+    ap.add_argument("--dir_num_freqs", type=int, default=4)
+    ap.add_argument("--pos_include_input", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+    ap.add_argument("--dir_include_input", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+    ap.add_argument("--n_layers", type=int, default=8)
+    ap.add_argument("--hidden_dim", type=int, default=256)
+    ap.add_argument("--skip_pos", type=int, default=5)
+    ap.add_argument("--initial_acc_opacity", type=float, default=0.0)
+    ap.add_argument("--sigma_activation", type=str, default="softplus", choices=["relu","softplus"])
+
+    # Sampling / Density
+    ap.add_argument("--rays_per_batch", type=int, default=2048)
+    ap.add_argument("--precrop_iters", type=int, default=500)
+    ap.add_argument("--precrop_frac", type=float, default=0.5)
+    ap.add_argument("--nc", type=int, default=64)
+    ap.add_argument("--nf", type=int, default=128)
+    ap.add_argument("--det_fine", action="store_true")
+    ap.add_argument("--raw_noise_std", type=float, default=0.0)
+    ap.add_argument("--targets_are_srgb", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+
+    # Optim / Schedule
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--scheduler", type=str, default="none")
+    ap.add_argument("--scheduler_params", type=str, default="{}")
+
+    # Train loop
+    ap.add_argument("--max_steps", type=int, default=200000)
+    ap.add_argument("--log_every", type=int, default=100)
+    ap.add_argument("--val_every", type=int, default=1000)
+    ap.add_argument("--ckpt_every", type=int, default=5000)
+    ap.add_argument("--micro_chunks", type=int, default=0)
+    ap.add_argument("--grad_clip_norm", type=float, default=0.0)
+
+    # Thermal (optional)
+    ap.add_argument("--thermal_throttle", action="store_true")
+    ap.add_argument("--gpu_temp_threshold", type=int, default=85)
+    ap.add_argument("--gpu_temp_check_every", type=int, default=20)
+    ap.add_argument("--gpu_cooldown_seconds", type=int, default=45)
+    ap.add_argument("--thermal_throttle_max_micro", type=int, default=16)
+    ap.add_argument("--thermal_throttle_sleep", type=float, default=5.0)
+
+    # Resume / Logging
+    ap.add_argument("--auto_resume", action="store_true",
+                    help="If true, resume from newest checkpoint in out_dir/checkpoints.")
+    ap.add_argument("--resume_path", type=str, default=None,
+                    help="Path to a specific checkpoint to resume from.")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="Convenience: 'latest' or a checkpoint path. Overrides --auto_resume/--resume_path.")
+    ap.add_argument("--resume_no_optim", action="store_true")
+    ap.add_argument("--on_interrupt", type=str, default="render_and_exit")
+    ap.add_argument("--on_pause_signal", type=str, default="render")
+    ap.add_argument("--use_tb", action="store_true")
+    ap.add_argument("--tb_logdir", type=str, default=None)
+    ap.add_argument("--tb_image_max_side", type=int, default=512)
+
+    # Path rendering
+    ap.add_argument("--render_path_after", action="store_true")
     ap.add_argument("--path_frames", type=int, default=120)
     ap.add_argument("--path_fps", type=int, default=30)
+    ap.add_argument("--path_type", type=str, default="circle", choices=["circle", "spiral"])
     ap.add_argument("--path_radius", type=float, default=None)
     ap.add_argument("--path_elev_deg", type=float, default=0.0)
     ap.add_argument("--path_yaw_deg", type=float, default=360.0)
     ap.add_argument("--path_res_scale", type=float, default=1.0)
 
-    # Memory / allocator controls
-    ap.add_argument("--cuda-expandable-segments", action="store_true",
-                    help="Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing torch.")
-    ap.add_argument("--micro-chunks", type=int, default=0,
-                    help="If >0, split each training ray batch into this many micro-chunks with per-chunk backward.")
-    ap.add_argument("--ckpt-mlp", action="store_true",
-                    help="Enable gradient checkpointing around NeRF MLP forward to save activation memory.")
+    ap.add_argument("--val_indices", type=str, default=None,
+                    help="Comma-separated validation frame indices, e.g. '0,8,17'")
+    ap.add_argument("--val_files", type=str, default=None,
+                    help="Comma-separated filenames/stems from transforms JSON, e.g. 'r_0,val/r_5'")
+    ap.add_argument("--progress_video_during_training", action="store_true")
+    ap.add_argument("--progress_frames", type=int, default=240)
+    ap.add_argument("--val_schedule", type=str, default="power",
+                    choices=["power","log","linear"],
+                    help="Validation cadence strategy; 'power' concentrates renders early.")
+    ap.add_argument("--val_events", type=int, default=None,
+                    help="Total number of validation events; if None, derived from --val_every.")
+    ap.add_argument("--val_power", type=float, default=2.0,
+                    help="Exponent for 'power' schedule (>1 → denser early).")
+    ap.add_argument("--val_first_step", type=int, default=None,
+                    help="First validation step; if None, chosen automatically.")
 
-    # TensorBoard logging
-    ap.add_argument("--tensorboard", action="store_true",
-                    help="Enable TensorBoard logging of metrics and GPU vitals.")
-    ap.add_argument("--tb-logdir", type=str, default=None,
-                    help="Optional TensorBoard log directory. Defaults to <save_dir>/tb.")
-    ap.add_argument("--tb-group-root", type=str, default=None,
-                    help="Optional directory to collect multiple runs for comparison. "
-                         "Creates a symlink <tb-group-root>/<run_name> -> <save_dir>/tb.")
+    # --- Eval/validation memory controls ---
+    ap.add_argument("--eval_chunk", type=int, default=2048, help="Rays per eval chunk.")
+    ap.add_argument("--eval_nc", type=int, default=None, help="Eval coarse samples per ray (default nc).")
+    ap.add_argument("--eval_nf", type=int, default=None, help="Eval fine samples per ray (default nf).")
+    ap.add_argument("--val_res_scale", type=float, default=1.0, help="Scale validation resolution to save VRAM.")
 
-    # Thermal safety controls
-    ap.add_argument("--gpu-temp-threshold", type=int, default=85,
-                    help="If GPU temp (°C) exceeds this, trigger thermal response. Default: 85.")
-    ap.add_argument("--gpu-temp-check-every", type=int, default=20,
-                    help="How many training steps between temperature checks. Default: 20.")
-    ap.add_argument("--gpu-cooldown-seconds", type=int, default=45,
-                    help="How long to sleep when too hot (if not using auto-throttle). Default: 45.")
-    ap.add_argument("--thermal-throttle", action="store_true",
-                    help="When hot, automatically increase micro-chunks up to a cap instead of sleeping.")
-    ap.add_argument("--thermal-throttle-max-micro", type=int, default=16,
-                    help="Upper bound for micro-chunks when --thermal-throttle is enabled. Default: 16.")
-    ap.add_argument("--thermal-throttle-sleep", type=float, default=5.0,
-                    help="Brief sleep (seconds) after applying throttle, to let temps settle. Default: 5.0.")
+    # One-switch: vanilla bmild parity
+    ap.add_argument("--vanilla", action="store_true",
+                    help="Enable bmild/nerf parity with standard Blender defaults.")
 
-    # Validation video export controls
-    ap.add_argument("--val-video-glob", type=str, default=None,
-                    help="Glob (relative to the experiment folder) for validation frames, e.g. 'val/**/*.png'. "
-                         "If omitted, defaults to a sensible pattern.")
-    ap.add_argument("--val-video-out", type=str, default=None,
-                    help="Output filename for the validation video (relative to experiment folder). "
-                         "Defaults to 'val_video.mp4'.")
-    ap.add_argument("--val-video-fps", type=int, default=24,
-                    help="FPS for validation video (default: 24).")
+    # ----- Render-only convenience -----
+    ap.add_argument("--render_only", action="store_true",
+                    help="Skip training, load a checkpoint (or latest), and render.")
+    ap.add_argument("--render_ckpt", type=str, default=None,
+                    help="Path to checkpoint to load in render-only mode; if omitted, load latest.")
+    ap.add_argument("--render_path", action="store_true",
+                    help="Also render a final camera-path video in render-only mode.")
 
-    # Run control / resume
-    ap.add_argument("--auto-resume", action="store_true",
-                    help="If set, automatically resume from latest checkpoint in the experiment folder.")
-    ap.add_argument("--resume", type=str, default=None,
-                    help="Path to a checkpoint .pt to resume from (overrides --auto-resume if both are set).")
-    ap.add_argument("--resume-no-optim", action="store_true",
-                    help="When resuming, load model weights but NOT optimizer/scaler (fresh optimizer).")
-    ap.add_argument("--on-interrupt", choices=["none","save","render","render_and_exit"], default="render_and_exit",
-                    help="Behavior on Ctrl+C (SIGINT): just ignore (none), save checkpoint only (save), "
-                         "render videos only (render), or render and then exit (render_and_exit).")
-    ap.add_argument("--on-pause-signal", choices=["render","save_and_render"], default="render",
-                    help="Behavior on SIGUSR1 during training: render videos, or save checkpoint then render.")
+    return ap
 
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
+    cfg = make_cfg_from_args(args)
 
-    # Set CUDA allocator before any torch import
-    if args.cuda_expandable_segments and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    trainer = Trainer(cfg=cfg)
 
-    # Delay importing Trainer (torch) until after env is set
-    from nerf_experiments.source.train.trainer import Trainer
-    from nerf_experiments.source.config.runtime_config import load_configs_with_extras
+    # -------------------------
+    # Render-only mode
+    # -------------------------
+    if args.render_only:
+        # Load requested checkpoint or latest available
+        ckpt_path = None
+        if args.render_ckpt:
+            ckpt_path = Path(args.render_ckpt)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"--render_ckpt not found: {ckpt_path}")
+        else:
+            ckpt_path = trainer.find_latest_checkpoint()
+            if ckpt_path is None:
+                raise FileNotFoundError("No checkpoint found for render-only mode.")
+        trainer.load_checkpoint(ckpt_path, load_optim=False)
 
-    # 1) Compose output directory (keep as Path)
-    out_dir = Path(args.out_root) / args.exp_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+        # Spin up a ValidationRenderer bound to this trainer
+        vr = ValidationRenderer(trainer, out_dir=Path(cfg.out_dir) / "validation", tb_logger=None)
 
-    # 2) EXTENDED overrides (core + new sections -> YAML-style namespaces)
-    overrides = {
-        # core
-        "data.root": args.data_root,
-        "train.out_dir": str(out_dir),
-        "train.device": args.device,
-        "train.max_steps": args.max_steps,
-        "train.rays_per_batch": args.rays_per_batch,
-        "train.val_every": args.val_every_steps,
-        "eval.eval_chunk": args.eval_chunk,
-        # memory / perf
-        "memory.micro_chunks": args.micro_chunks,
-        "memory.ckpt_mlp": args.ckpt_mlps if hasattr(args, "ckpt_mlps") else args.ckpt_mlp,  # keep args.ckpt_mlp
-        "memory.cuda_expandable_segments": args.cuda_expandable_segments,
-        # logging / TB
-        "logging.tensorboard": args.tensorboard,
-        "logging.tb_logdir": args.tb_logdir,
-        "logging.tb_group_root": getattr(args, "tb_group_root", None),
-        # safety / thermals
-        "safety.thermal_throttle": args.thermal_throttle,
-        "safety.thermal_throttle_max_micro": args.thermal_throttle_max_micro,
-        "safety.thermal_throttle_sleep": args.thermal_throttle_sleep,
-        "safety.gpu_temp_threshold": args.gpu_temp_threshold,
-        "safety.gpu_temp_check_every": args.gpu_temp_check_every,
-        # path render controls
-        "path.render_path": args.render_path,
-        "path.path_type": args.path_type,
-        "path.path_frames": args.path_frames,
-        "path.path_fps": args.path_fps,
-        "path.path_res_scale": args.path_res_scale,
-        # validation video (if you wired these into extras; otherwise leave as direct setattrs later)
-        "logging.val_video_glob": args.val_video_glob,
-        "logging.val_video_out": args.val_video_out,
-        "logging.val_video_fps": args.val_video_fps,
-    }
-    # prune unset values (None)
-    overrides = {k: v for k, v in overrides.items() if v is not None}
+        # Parse indices (defaults to [0])
+        if args.val_indices:
+            idxs = [int(tok) for tok in args.val_indices.replace(",", " ").split()]
+        else:
+            idxs = [0]
 
-    # 3) Load frozen runtime config + EXTRAS (TB/thermals/eval/path/etc.)
-    rt_cfg, extras, _ = load_configs_with_extras(
-        yaml_path=args.config,
-        cli_overrides=overrides,
-        save_dir=out_dir,
-    )
+        # Render static validation frames (RGB/opacity/depth) with the final model
+        vr.render_selected_frames(frame_indices=idxs, res_scale=float(cfg.val_res_scale),
+                                  log_to_tb=False, tb_step=None)
 
-    # 4) Build trainer (no TB args in constructor)
-    trainer = Trainer(cfg=rt_cfg)
+        # Optional: final camera-path video (smooth circle/spiral)
+        if args.render_path or args.render_path_after:
+            vr.render_final_camera_path(
+                n_frames=int(cfg.path_frames),
+                fps=int(cfg.path_fps),
+                path_type=str(cfg.path_type),
+                radius=cfg.path_radius,
+                elevation_deg=float(cfg.path_elev_deg),
+                yaw_range_deg=float(cfg.path_yaw_deg),
+                res_scale=float(cfg.path_res_scale),
+                world_up=None,            # auto-detect from validation scene
+                convention="opengl",      # must match get_camera_rays
+                out_subdir="final_path",
+                basename="camera_path",
+            )
+        return
 
-    # 5) Apply EXTRAS from YAML/CLI namespaces
-    for k, v in (extras or {}).items():
-        if v is not None:
-            setattr(trainer, k, v)
-
-    # 6) CLI-only flags that are not part of extras
-    setattr(trainer, "auto_resume", bool(args.auto_resume))
-    setattr(trainer, "resume_path", args.resume)
-    setattr(trainer, "resume_no_optim", bool(getattr(args, "resume_no_optim", False)))
-    setattr(trainer, "on_interrupt", getattr(args, "on_interrupt", "render_and_exit"))
-    setattr(trainer, "on_pause_signal", getattr(args, "on_pause_signal", "render"))
-    setattr(trainer, "val_frame_idx", int(args.val_frame_idx))
-    # (If val-video settings weren’t mapped into extras, set them directly:)
-    if getattr(trainer, "val_video_glob", None) is None:
-        setattr(trainer, "val_video_glob", args.val_video_glob)
-    if getattr(trainer, "val_video_out", None) is None:
-        setattr(trainer, "val_video_out", args.val_video_out)
-    if getattr(trainer, "val_video_fps", None) is None:
-        setattr(trainer, "val_video_fps", int(args.val_video_fps))
-
-    # 7) Initialize TensorBoard AFTER attributes are final
-    trainer.maybe_init_tensorboard()
-
-    # 8) Train
+    # -------------------------
+    # Normal training
+    # -------------------------
     trainer.train()
-
-    # 9) Optional: render novel path after training
-    if args.render_path:
-        path_out = out_dir / "render_path"
-        trainer.render_camera_path(
-            out_dir=path_out,
-            n_frames=args.path_frames,
-            fps=args.path_fps,
-            path_type=args.path_type,
-            radius=args.path_radius,
-            elevation_deg=args.path_elev_deg,
-            yaw_range_deg=args.path_yaw_deg,
-            res_scale=args.path_res_scale,
-            save_video=True,
-        )
-
 
 if __name__ == "__main__":
     main()

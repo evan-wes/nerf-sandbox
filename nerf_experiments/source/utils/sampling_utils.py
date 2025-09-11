@@ -31,35 +31,35 @@ def sample_pdf(
         The sampled locations along the ray based on the input histogram.
     """
 
-    # Get the device
-    device = weights.device
+    # Get the device (align to bins to avoid cross-device issues)
+    device = bins.device
 
-    # Avoid zeros in demonminators by adding a small epsilon to the input weights
+    # Avoid zeros in denominators and tiny negatives in weights
     epsilon = 1e-5
-    weights = weights + epsilon
+    weights = weights.to(device=device, dtype=bins.dtype).clamp_min(0) + epsilon
     weights_sum = weights.sum(dim=-1, keepdim=True)
+
     # If sum is still ~0 (all near-zero), fall back to uniform
     use_uniform_samples = (weights_sum <= 1e-6)
     weights = torch.where(use_uniform_samples, torch.ones_like(weights), weights)
 
     # Create the probability density function by normalizing the weights
-    pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
+    pdf = weights / torch.sum(weights, dim=-1, keepdim=True).clamp_min(epsilon)
 
     # Sum the PDF to create the cumulative distribution function,
     # prepending 0 as the first value
     cdf = torch.cumsum(pdf, dim=-1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1) # shape (num_rays, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # shape (num_rays, num_bins+1)
 
     # Create the positions along the ray to sample from
     if deterministic:
-        # Create a uniform set of points from 0 to 1 and expand to shape (num_rays, n_samples)
-        u = torch.linspace(0.0, 1.0, steps=n_samples, device=device)
-        u = u.expand(*cdf.shape[:-1], n_samples) # shape (num_rays, n_samples)
+        # Use interval centers to reduce edge bias
+        u = (torch.arange(n_samples, device=device, dtype=bins.dtype) + 0.5) / n_samples
+        u = u.unsqueeze(0).expand(*cdf.shape[:-1], n_samples)  # shape (num_rays, n_samples)
     else:
         # Create a random set of points between 0 to 1 with shape (num_rays, n_samples)
-        u = torch.rand(*cdf.shape[:-1], n_samples, device=device) # shape (num_rays, n_samples)
+        u = torch.rand(*cdf.shape[:-1], n_samples, device=device, dtype=bins.dtype)
     u = u.clamp(0.0, 1.0 - 1e-8)
-
 
     # Get the positions in the CDF that bracket each of the sampled points between 0 and 1
     cdf = cdf.contiguous()
@@ -70,6 +70,7 @@ def sample_pdf(
 
     # Gather the indices into sets of [lower_index, upper_index] spanning the bin containing each sampled point
     index_bins = torch.stack([below, above], dim=-1)  # shape (num_rays, n_samples, 2)
+
     # Gather the CDF values and bins
     gather_shape = [*index_bins.shape[:-1], cdf.shape[-1]]
     cdf_values = torch.gather(cdf.unsqueeze(1).expand(gather_shape), 2, index_bins)
@@ -77,15 +78,16 @@ def sample_pdf(
 
     # Invert the CDF for inverse-transform sampling by linear interpolation
     denominator = (cdf_values[..., 1] - cdf_values[..., 0]).clamp(min=epsilon)
-    t = (u - cdf_values[..., 0])/denominator
-    samples = bins_values[..., 0] + t * (bins_values[..., 1] - bins_values[..., 0]) # shape (num_rays, n_samples)
+    t = (u - cdf_values[..., 0]) / denominator
+    samples = bins_values[..., 0] + t * (bins_values[..., 1] - bins_values[..., 0])  # (num_rays, n_samples)
 
     # If uniform fallback case, just stratified uniform within [bins.min, bins.max]
     if use_uniform_samples.any():
         low = bins[:, :1]
         high = bins[:, -1:]
         if deterministic:
-            u2 = torch.linspace(0.0, 1.0, n_samples, device=bins.device, dtype=bins.dtype).unsqueeze(0).expand_as(samples)
+            u2 = (torch.arange(n_samples, device=device, dtype=bins.dtype) + 0.5) / n_samples
+            u2 = u2.unsqueeze(0).expand_as(samples)
         else:
             u2 = torch.rand_like(samples)
         uniform = low + (high - low) * u2

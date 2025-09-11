@@ -84,8 +84,8 @@ class PositionalEncoder(nn.Module):
         """
 
         # [num_rays, None, D] * [F] -> [num_rays, F, D]
-        scale = (2 * torch.pi) if self.use_two_pi else 1.0
-        xb = x.unsqueeze(-2) * (self.freq_bands * scale).unsqueeze(-1)  # broadcast
+        scale = (2 * torch.pi) if self.use_two_pi else torch.tensor(1.0, device=x.device, dtype=x.dtype)
+        xb = x.unsqueeze(-2) * (self.freq_bands.to(dtype=x.dtype) * scale).unsqueeze(-1)  # broadcast
 
         # [num_rays, F, D] -> [num_rays, F, D] each
         sin_feats = torch.sin(xb)
@@ -98,3 +98,21 @@ class PositionalEncoder(nn.Module):
             enc = torch.cat([x, enc], dim=-1)
 
         return enc
+
+
+def get_vanilla_nerf_encoders():
+    """
+    Return (pos_encoder, dir_encoder) using the official NeRF defaults:
+      - positions: L=10, include_input=True, log-spaced, no 2π
+      - viewdirs:  L=4,  include_input=True, log-spaced, no 2π
+    out_dims: pos=3+3*10*2=63, dir=3+3*4*2=27
+    """
+    pos_enc = PositionalEncoder(
+        input_dims=3, num_freqs=10,
+        include_input=True, log_spaced=True, use_two_pi=False
+    )
+    dir_enc = PositionalEncoder(
+        input_dims=3, num_freqs=4,
+        include_input=True, log_spaced=True, use_two_pi=False
+    )
+    return pos_enc, dir_enc

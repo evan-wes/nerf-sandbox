@@ -20,9 +20,10 @@ class NeRF(nn.Module):
         n_layers: int = 8,
         hidden_dim: int = 256,
         skip_pos: int = 5,
-        acc0: float = 0.05,
         near: float = 2.0,
-        far: float = 6.0
+        far: float = 6.0,
+        initial_acc_opacity: float | None = None,
+        sigma_activation: str = "softplus"
     ) -> None:
         """
         Constructor for the class. Builds the sequential layer architecture, including
@@ -43,12 +44,16 @@ class NeRF(nn.Module):
             The index of the layer whose activation we concatenate the input encoded
             position vector. Default is 5, i.e. the encoded position is concatenated
             with the fifth layer's activation output vector
-        acc0 : float, optional
-            Initial accumulated opacity. Used to initialize sigma. Default is 5 percent
         near : float, optional
             Position of the near plane. Default is 2.0
         far : float, optional
             Position of the far plane. Default is 6.0
+        initial_acc_opacity : float, optional
+            Initial accumulated opacity, used to initialize sigma. Defaults to None
+        sigma_activation : str, optional
+            Type of activation to be applied to the raw sigma output. Used to solve
+            for a proper initialization, if initial_acc_opacity is provided. Defaults
+            to "softplus"
         """
         super(NeRF, self).__init__()
 
@@ -85,34 +90,70 @@ class NeRF(nn.Module):
         self.color_fc = nn.Linear(self.hidden_dim + self.enc_dir_dim, self.hidden_dim//2)
         self.color_out = nn.Linear(self.hidden_dim//2, 3)  # raw rgb logits
 
-        # -------- Recommended initializations --------#
-        b = self._sigma_bias_for_initial_acc(acc0, near=near, far=far)
-        with torch.no_grad():
-            self.sigma_out.bias.fill_(b)
-            # self.sigma_out.weight.mul_(0.1)
-            self.color_out.bias.zero_()
-            self.color_out.weight.mul_(0.1)
+        # -------- Initialize sigma bias for accumulated opacity --------#
+        if initial_acc_opacity is not None:
+            sigma_bias = self._sigma_bias_for_initial_acc_opacity(
+                initial_acc_opacity,
+                near=near,
+                far=far,
+                activation=sigma_activation
+            )
+            with torch.no_grad():
+                self.sigma_out.bias.fill_(sigma_bias)
+                # self.sigma_out.weight.mul_(0.1)
+                self.color_out.bias.zero_()
+                self.color_out.weight.mul_(0.1)
 
-        # -------- Recommended initialization --------
-        # with torch.no_grad():
-        #     # Start very transparent so acc << 1 at init
-        #     self.sigma_out.bias.fill_(-10.0)     # try -8 to -12; -10 is a good default for far-near ≈ 4
-        #     self.sigma_out.weight.mul_(0.1)      # small σ head weights
-        #     self.color_out.bias.zero_()
-        #     self.color_out.weight.mul_(0.1)      # small RGB head weights
-
+        #----- Initialize the MLP layers -----#
         self._init_mlp()
 
-    def _sigma_bias_for_initial_acc(self, acc0: float, near: float, far: float) -> float:
-        """Solve for b in softplus(b) so that 1-exp(-softplus(b)*(far-near)) ~= acc0."""
-        acc0 = max(1e-6, min(0.99, acc0))
-        L = float(far - near)
-        # target avg sigma
-        sig = -math.log(1.0 - acc0) / max(1e-8, L)
-        # softplus^{-1}(sig) = log(exp(sig)-1)
-        return float(math.log(math.expm1(sig)))
+    def _sigma_bias_for_initial_acc_opacity(
+        self,
+        initial_acc_opacity: float,
+        near: float,
+        far: float,
+        activation: str = "softplus"
+    ) -> float:
+        """
+        Choose a bias 'b' so that activation(b) integrates to the desired initial
+        accumulated opacity over a uniform ray from [near, far].
+
+        We solve for a target per-sample density sigma* such that:
+            1 - exp(-sigma* * (far - near)) = initial_acc_opacity
+        and then pick 'b' so that activation(b) = sigma*.
+
+        Supported:
+        - activation == "softplus":  b = log(exp(sigma*) - 1)
+        - activation == "relu":      b = sigma*     (since ReLU(b) = b for b>0)
+        - fallback (unknown/linear): b = sigma*
+        """
+        # Clamp the requested opacity into a safe open interval
+        p = float(max(1e-6, min(0.99, initial_acc_opacity)))
+
+        # Uniform path length
+        L = float(max(1e-8, far - near))
+
+        # Target density so that the integrated transmittance matches p
+        sigma_star = -math.log(1.0 - p) / L  # > 0
+
+        act = (activation or "softplus").lower()
+
+        if act == "softplus":
+            # inverse softplus: x = log(exp(y) - 1)  (use expm1 for stability)
+            return float(math.log(math.expm1(sigma_star)))
+        elif act == "relu":
+            # ReLU(bias) = sigma_star  → bias = sigma_star (positive)
+            return float(sigma_star)
+        else:
+            # Sensible fallback: assume linear/identity activation on sigma_raw
+            # so that sigma_raw ≈ sigma_star.
+            return float(sigma_star)
 
     def _init_mlp(self):
+        """
+        Gives recommended initializations for the main MLP trunk, and feature
+        and color layers
+        """
         for m in self.mlp:
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
