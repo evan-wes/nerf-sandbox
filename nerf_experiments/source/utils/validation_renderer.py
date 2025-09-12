@@ -318,19 +318,13 @@ class ValidationRenderer:
                 vids.append(out)
         return vids
 
-    # -------------------------------------------------------------------------
-    # Progress camera-path video DURING training (block-by-block)
-    # -------------------------------------------------------------------------
-
     def setup_progress_plan(
         self,
-        max_steps: int,
-        val_every: int,
-        n_frames: int,
         *,
-        num_events: Optional[int] = None,   # total validation events (dense-early schedule)
-        path_type: str = "circle",          # "circle" | "spiral"
-        radius: Optional[float] = None,     # if None, derived from median cam distance
+        val_steps: Sequence[int],          # REQUIRED: list of training iterations when validation runs
+        n_frames: int,                     # total frames in the progress video
+        path_type: str = "circle",         # "circle" | "spiral"
+        radius: Optional[float] = None,    # if None, derived from median camera distance
         elevation_deg: float = 0.0,
         yaw_range_deg: float = 360.0,
         res_scale: float = 1.0,
@@ -339,39 +333,64 @@ class ValidationRenderer:
         frames_subdir: str = "progress_by_val",
     ) -> None:
         """
-        Plan a training-progress camera path video rendered incrementally across validation events.
+        Plan a progress-video that is rendered incrementally across *this* validation schedule.
 
-        - WHEN we validate (how many events happen) is decoupled from
-        WHERE we are on the path (poses are uniformly spaced around the loop).
-        - Frames are split as evenly as possible across events so the final
-        video has constant angular speed even if validation is denser early.
+        - `val_steps` defines WHEN validation happens (length E).
+        - We generate ONE smooth camera path of `n_frames` poses.
+        - We split those poses into E contiguous blocks so the camera moves at a
+        constant angular speed in the final video regardless of early-dense validation.
 
-        Side effects (persisted state used by render_progress_block/finalize):
-        * self._prog_poses         : List[np.ndarray(4,4)] length n_frames
-        * self._prog_H, _prog_W    : output resolution
-        * self._prog_K             : intrinsics (3,3) scaled by res_scale
-        * self._prog_block_sizes   : list of per-event frame counts that sum to n_frames
-        * self._prog_next_block_idx: which validation event we're on
-        * self._prog_frame_ptr     : next global frame index to write [0..n_frames)
-        * self._prog_total_frames  : n_frames
-        * self._prog_frames_dir    : directory where progressive frames are written
-        * self._prog_fps           : fps for final video assembly
-        * self._prog_active        : flag indicating plan is ready
+        Stored state:
+        _prog_pose_list      : List[np.ndarray(4,4)] length n_frames
+        _prog_H, _prog_W, _prog_K
+        _prog_block_sizes    : list[int] of length E (sum = n_frames)
+        _prog_next_block_idx : which block to render next
+        _prog_frames_dir     : output directory
+        _prog_val_steps      : copy of the schedule (for reference/diagnostics)
+        _prog_fps            : fps for final video muxing
         """
-        assert int(n_frames) > 0, "n_frames must be > 0"
+        # ----------------------------
+        # Validate inputs
+        # ----------------------------
+        val_steps = list(dict.fromkeys(int(s) for s in val_steps))  # de-dup, preserve order
+        assert len(val_steps) >= 1, "val_steps must contain at least one iteration"
+        assert n_frames > 0, "n_frames must be > 0"
 
-        # Determine how many validation events will occur.
-        if num_events is None:
-            if val_every and val_every > 0:
-                num_events = max(1, (int(max_steps) + int(val_every) - 1) // int(val_every))
-            else:
-                num_events = 1
-        num_events = int(max(1, num_events))
-        assert int(n_frames) > 0
+        scene = self.tr.val_scene
 
-        # 2) build poses with the shared generator
+        # ----------------------------
+        # Determine radius if not provided
+        # ----------------------------
+        if radius is None:
+            cam_positions = np.stack([np.array(f.c2w, dtype=np.float32)[:3, 3] for f in scene.frames], axis=0)
+            dists = np.linalg.norm(cam_positions, axis=1)
+            med = np.median(dists)
+            if not np.isfinite(med) or med < 1e-3:
+                med = 4.0  # sensible default for Blender synthetic
+            radius = float(med)
+
+        # ----------------------------
+        # Auto-detect world-up if needed
+        # ----------------------------
+        if world_up is None:
+            y_axes = []
+            for f in scene.frames:
+                C = np.array(f.c2w, dtype=np.float32)
+                y_axes.append(C[:3, 1] / (np.linalg.norm(C[:3, 1]) + 1e-8))
+            up_vec = np.mean(np.stack(y_axes, axis=0), axis=0)
+            if np.linalg.norm(up_vec) < 1e-6:
+                up_vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            world_up = (up_vec / (np.linalg.norm(up_vec) + 1e-8)).astype(np.float32)
+        else:
+            world_up = np.asarray(world_up, dtype=np.float32)
+            world_up /= (np.linalg.norm(world_up) + 1e-8)
+
+        # ----------------------------
+        # Build the single, smooth camera path (constant angular spacing)
+        # (Uses your convention-respecting generator from render_utils)
+        # ----------------------------
         poses, H, W, K = generate_camera_path_poses(
-            val_scene=self.tr.val_scene,
+            val_scene=scene,
             n_frames=int(n_frames),
             path_type=str(path_type),
             radius=radius,
@@ -381,14 +400,22 @@ class ValidationRenderer:
             world_up=world_up,
         )
 
-        # 3) split evenly across events (constant angular speed)
-        base = int(n_frames) // num_events
-        rem  = int(n_frames) - base * num_events
-        block_sizes = [base + (1 if i < rem else 0) for i in range(num_events)]
+        # ----------------------------
+        # Evenly split n_frames across the *actual* number of validation events
+        # ----------------------------
+        E = len(val_steps)
+        base = int(n_frames) // E
+        rem  = int(n_frames) - base * E
+        block_sizes = [base + (1 if i < rem else 0) for i in range(E)]
+        assert sum(block_sizes) == int(n_frames)
 
-        # 4) persist plan (and DO NOT re-call this each validate)
+        # ----------------------------
+        # Output dirs & persistent plan state
+        # ----------------------------
         self._prog_frames_dir = Path(self.out_dir) / str(frames_subdir)
-        self._prog_frames_dir.mkdir(parents=True, exist_ok=True)
+        (self._prog_frames_dir / "rgb").mkdir(parents=True, exist_ok=True)
+        (self._prog_frames_dir / "depth").mkdir(parents=True, exist_ok=True)
+        (self._prog_frames_dir / "opacity").mkdir(parents=True, exist_ok=True)
 
         self._prog_poses = poses
         self._prog_H, self._prog_W = int(H), int(W)
@@ -397,8 +424,8 @@ class ValidationRenderer:
 
         self._prog_block_sizes = block_sizes
         self._prog_next_block_idx = 0
-        self._prog_frame_ptr = 0
         self._prog_total_frames = int(n_frames)
+        self._prog_val_steps = list(val_steps)
         self._prog_active = True
 
     @torch.no_grad()
@@ -413,6 +440,10 @@ class ValidationRenderer:
 
         for i in tqdm(range(start_idx, end_idx),
                       desc=f"[PROGRESS] block {block_idx+1}/{len(self._prog_block_sizes)}"):
+            p = self._prog_frames_dir / f"frame_{i:05d}.png"
+            if p.exists():
+                # already rendered in a previous run/resume; skip work
+                continue
             c2w = self._prog_poses[i]
             self.tr.nerf_c.eval(); self.tr.nerf_f.eval()
             rgb_lin = render_pose(
@@ -569,3 +600,37 @@ class ValidationRenderer:
         imgs = [imageio.imread(p) for p in frame_paths]
         imageio.mimwrite(mp4, imgs, fps=int(fps), codec="libx264", quality=8)
         return mp4
+
+    def resume_to_step(self, current_step: int) -> None:
+        """
+        Advance internal progress state to reflect that training has already
+        reached `current_step`. We also scan the frames directory to pick up
+        partially written progress frames, so reruns don't duplicate work.
+        """
+        # If no plan is active, nothing to do
+        if not getattr(self, "_prog_active", False):
+            return
+        if not hasattr(self, "_prog_block_sizes") or not hasattr(self, "_prog_val_steps"):
+            return
+
+        # 1) How many validation events should have fired already?
+        passed_events = 0
+        for s in self._prog_val_steps:
+            if s <= int(current_step):
+                passed_events += 1
+            else:
+                break
+
+        # 2) How many frames are already on disk?
+        n_existing = len(sorted((self._prog_frames_dir or self.out_dir).glob("frame_*.png")))
+        cum = 0
+        idx_from_disk = 0
+        for i, b in enumerate(self._prog_block_sizes):
+            if cum + b <= n_existing:
+                cum += b
+                idx_from_disk = i + 1
+            else:
+                break
+
+        # Use the max of both signals (disk is the ground truth for idempotency)
+        self._prog_next_block_idx = max(passed_events, idx_from_disk)

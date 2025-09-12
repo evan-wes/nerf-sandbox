@@ -46,7 +46,7 @@ def test_intrinsics_and_resize_across_downscale(tmp_path: Path, downscale: int):
                      camera_angle_x=np.deg2rad(60))
 
     # Load with parameterized downscale
-    loader = BlenderSceneLoader(tmp_path, downscale=downscale, white_bg=True)
+    loader = BlenderSceneLoader(tmp_path, downscale=downscale, white_bkgd=True)
     scene = loader.load("train")
 
     # Expect images resized by factor

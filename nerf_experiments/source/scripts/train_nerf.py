@@ -112,7 +112,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Train loop
     ap.add_argument("--max_steps", type=int, default=200000)
     ap.add_argument("--log_every", type=int, default=100)
-    ap.add_argument("--val_every", type=int, default=1000)
     ap.add_argument("--ckpt_every", type=int, default=5000)
     ap.add_argument("--micro_chunks", type=int, default=0)
     ap.add_argument("--grad_clip_norm", type=float, default=0.0)
@@ -149,6 +148,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--path_yaw_deg", type=float, default=360.0)
     ap.add_argument("--path_res_scale", type=float, default=1.0)
 
+    ap.add_argument("--val_every", type=int, default=None)
     ap.add_argument("--val_indices", type=str, default=None,
                     help="Comma-separated validation frame indices, e.g. '0,8,17'")
     ap.add_argument("--val_files", type=str, default=None,
@@ -156,14 +156,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--progress_video_during_training", action="store_true")
     ap.add_argument("--progress_frames", type=int, default=240)
     ap.add_argument("--val_schedule", type=str, default="power",
-                    choices=["power","log","linear"],
                     help="Validation cadence strategy; 'power' concentrates renders early.")
-    ap.add_argument("--val_events", type=int, default=None,
+    ap.add_argument("--num_val_steps", type=int, default=None,
                     help="Total number of validation events; if None, derived from --val_every.")
     ap.add_argument("--val_power", type=float, default=2.0,
                     help="Exponent for 'power' schedule (>1 → denser early).")
-    ap.add_argument("--val_first_step", type=int, default=None,
-                    help="First validation step; if None, chosen automatically.")
 
     # --- Eval/validation memory controls ---
     ap.add_argument("--eval_chunk", type=int, default=2048, help="Rays per eval chunk.")

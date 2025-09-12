@@ -54,7 +54,7 @@ def tiny_blender_scene(tmp_path: Path):
 
     _make_transforms(tmp_path / "transforms_train.json", [("im0", T0), ("im1", T1)])
 
-    loader = BlenderSceneLoader(tmp_path, downscale=1, white_bg=True)
+    loader = BlenderSceneLoader(tmp_path, downscale=1, white_bkgd=True)
     scene = loader.load("train")
     return scene
 
@@ -88,7 +88,7 @@ def test_sampler_shapes_and_norms(tiny_blender_scene: "Scene"):
 
 def test_white_bg_compositing_with_rgba(tiny_blender_scene: "Scene"):
     """
-    When Scene.white_bg=True and source has RGBA, the sampler should composite:
+    When Scene.white_bkgd=True and source has RGBA, the sampler should composite:
       rgb = rgb_ * alpha + (1-alpha) * 1
     Verify the result lies in [0,1] and is brighter than raw rgb_ for alpha<1.
     """

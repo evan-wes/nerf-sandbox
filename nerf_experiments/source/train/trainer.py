@@ -317,22 +317,21 @@ class Trainer:
         # --- Build validation step schedule (dense early, taper later) ---
         self.val_steps = build_validation_steps(
             max_steps=int(getattr(self.cfg, "max_steps", 200_000)),
-            base_every=int(getattr(self.cfg, "val_every", 1000)),
-            events=getattr(self.cfg, "val_events", None),
-            strategy=str(getattr(self.cfg, "val_schedule", "power")),
-            power=float(getattr(self.cfg, "val_power", 2.0)),
-            first_step=getattr(self.cfg, "val_first_step", None),
-            last_step=int(getattr(self.cfg, "max_steps", 200_000)),
+            base_every=getattr(self.cfg, "val_every", None),
+            num_val_steps=getattr(self.cfg, "num_val_steps", None),
+            schedule=str(getattr(self.cfg, "val_schedule", "power")),
+            power=float(getattr(self.cfg, "val_power", 2.0))
         )
+        self._val_step_set = set(self.val_steps)
         self._val_next_idx = 0
         self._val_next_step = self.val_steps[0] if self.val_steps else None
+        if self._val_next_step is not None:
+            print(f"[VAL] first validation at step {self._val_next_step} (1/{len(self.val_steps)})")
 
         # --- Progress video plan uses the number of validation events to keep speed constant ---
         self.valr.setup_progress_plan(
-            max_steps=int(getattr(self.cfg, "max_steps", 200_000)),
-            val_every=int(getattr(self.cfg, "val_every", 1000)),
+            val_steps=self.val_steps,
             n_frames=int(getattr(self.cfg, "progress_frames", 240)),
-            num_events=len(self.val_steps),  # <— use event count from schedule
             path_type=str(getattr(self.cfg, "path_type", "circle")),
             radius=getattr(self.cfg, "path_radius", None),
             elevation_deg=float(getattr(self.cfg, "path_elev_deg", 10.0)),
@@ -424,10 +423,11 @@ class Trainer:
 
     # ---------------- Train loop ----------------
     def train(self):
+        interrupted = False
         it = iter(self.sampler)
         self.nerf_c.train(); self.nerf_f.train()
 
-        # Resume
+        # ---- Resume logic ----
         start_step = 1
         resume_from = Path(self.resume_path) if getattr(self, "resume_path", None) else None
         if resume_from is None and self.auto_resume:
@@ -435,10 +435,28 @@ class Trainer:
         if resume_from and resume_from.exists():
             start_step = self.load_checkpoint(resume_from, load_optim=(not self.resume_no_optim)) + 1
             print(f"[CKPT] Resuming from step {start_step} ({resume_from.name})")
+            if getattr(self.cfg, "progress_video_during_training", False):
+                # We set up the progress plan in __init__; now align it to the resumed step.
+                self.valr.resume_to_step(start_step - 1)
+                done = sum(self.valr._prog_block_sizes[: self.valr._prog_next_block_idx])
+                print(f"[RESUME] progress frames already on disk: {done}/{self.valr._prog_total_frames} "
+                    f"(next block idx = {self.valr._prog_next_block_idx})")
+
+        # --- Fast-forward validation schedule to match the resume step ---
+        # We want the first _val_next_step that is >= start_step
+        i = 0
+        while i < len(self.val_steps) and self.val_steps[i] < start_step:
+            i += 1
+        self._val_next_idx = i
+        self._val_next_step = self.val_steps[i] if i < len(self.val_steps) else None
+
+        if self._val_next_step is not None:
+            print(f"[VAL] next validation at step {self._val_next_step} ({i+1}/{len(self.val_steps)})")
+        else:
+            print("[VAL] validation schedule already completed at resume.")
 
         max_steps  = int(getattr(self.cfg, "max_steps", 200_000))
         log_every  = int(getattr(self.cfg, "log_every", 100))
-        val_every  = int(getattr(self.cfg, "val_every", 1000))
         ckpt_every = int(getattr(self.cfg, "ckpt_every", 5000))
 
         for step in range(start_step, max_steps + 1):
@@ -499,6 +517,7 @@ class Trainer:
                 except Exception as e:
                     print(f"[INT] checkpoint save failed: {e}")
                 print("[INT] Exiting training loop.")
+                interrupted = True
                 break
 
             # Logs
@@ -536,6 +555,11 @@ class Trainer:
                 self._val_next_idx += 1
                 self._val_next_step = self.val_steps[self._val_next_idx] \
                     if self._val_next_idx < len(self.val_steps) else None
+                if self._val_next_step is not None:
+                    print(f"[VAL] next validation at step {self._val_next_step} "
+                        f"({self._val_next_idx+1}/{len(self.val_steps)})")
+                else:
+                    print("[VAL] schedule complete.")
 
 
                 self.nerf_c.train(); self.nerf_f.train()
@@ -543,6 +567,11 @@ class Trainer:
             # Checkpoints
             if step % ckpt_every == 0:
                 self.save_checkpoint(step)
+
+        # If we were interrupted, close TB and exit immediately (no rendering).
+        if interrupted:
+            self.tb_logger.close()
+            return
 
         # ---------- Post-training exports (ValidationRenderer owns everything) ----------
         # A) Per-index time-lapse videos (RGB / depth / opacity)

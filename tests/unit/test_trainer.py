@@ -54,7 +54,7 @@ def test_runtime_config_is_frozen(tiny_blender):
 
     # Build a NerfConfig (sectioned) similar to your YAML
     nc = NerfConfig(
-        data=DataConfig(kind="blender", root=str(root), white_bg=True, downscale=1, split="train"),
+        data=DataConfig(kind="blender", root=str(root), white_bkgd=True, downscale=1, split="train"),
         camera=CameraConfig(ndc=False, near=0.1, far=2.0, model="pinhole"),
         train=TrainSection(device="cpu", rays_per_batch=64, max_steps=1000, amp=False, val_every=1000, log_every=50, ckpt_every=1000, lr=1e-3, out_dir=str(root / "outs")),
         render=RenderConfig(Nc=8, Nf=4, det_fine=False),
@@ -76,7 +76,7 @@ def test_trainer_init_and_scheduler_cosine(tiny_blender):
     root, H, W = tiny_blender
 
     nc = NerfConfig(
-        data=DataConfig(kind="blender", root=str(root), white_bg=True, downscale=1, split="train"),
+        data=DataConfig(kind="blender", root=str(root), white_bkgd=True, downscale=1, split="train"),
         camera=CameraConfig(ndc=False, near=0.1, far=2.0, model="pinhole"),
         train=TrainSection(device="cpu", rays_per_batch=32, max_steps=200, amp=False, val_every=1000, log_every=50, ckpt_every=1000, lr=5e-4, out_dir=str(root / "outs")),
         render=RenderConfig(Nc=4, Nf=2, det_fine=False),
@@ -101,7 +101,7 @@ def test_train_step_smoke(tiny_blender):
     root, H, W = tiny_blender
 
     nc = NerfConfig(
-        data=DataConfig(kind="blender", root=str(root), white_bg=True, downscale=1, split="train"),
+        data=DataConfig(kind="blender", root=str(root), white_bkgd=True, downscale=1, split="train"),
         camera=CameraConfig(ndc=False, near=0.1, far=2.0, model="pinhole"),
         train=TrainSection(device="cpu", rays_per_batch=16, max_steps=20, amp=False, val_every=1000, log_every=10, ckpt_every=1000, lr=1e-3, out_dir=str(root / "outs")),
         render=RenderConfig(Nc=4, Nf=2, det_fine=False),
@@ -124,7 +124,7 @@ def test_validate_full_image_shape(tiny_blender):
     root, H, W = tiny_blender
 
     nc = NerfConfig(
-        data=DataConfig(kind="blender", root=str(root), white_bg=True, downscale=1, split="train"),
+        data=DataConfig(kind="blender", root=str(root), white_bkgd=True, downscale=1, split="train"),
         camera=CameraConfig(ndc=False, near=0.1, far=2.0, model="pinhole"),
         train=TrainSection(device="cpu", rays_per_batch=32, max_steps=10, amp=False, val_every=10, log_every=10, ckpt_every=10, lr=1e-3, out_dir=str(root / "outs")),
         render=RenderConfig(Nc=4, Nf=2, det_fine=True),  # det for deterministic val
@@ -147,7 +147,7 @@ def test_hierarchical_sampling_calls_pdf(monkeypatch, tiny_blender):
     root, H, W = tiny_blender
 
     nc = NerfConfig(
-        data=DataConfig(kind="blender", root=str(root), white_bg=True, downscale=1, split="train"),
+        data=DataConfig(kind="blender", root=str(root), white_bkgd=True, downscale=1, split="train"),
         camera=CameraConfig(ndc=False, near=0.1, far=2.0, model="pinhole"),
         train=TrainSection(device="cpu", rays_per_batch=8, max_steps=10, amp=False, val_every=10, log_every=10, ckpt_every=10, lr=1e-3, out_dir=str(root / "outs")),
         render=RenderConfig(Nc=6, Nf=3, det_fine=False),
