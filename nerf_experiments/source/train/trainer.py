@@ -290,9 +290,12 @@ class Trainer:
             image_max_side=int(getattr(cfg, "tb_image_max_side", 512)),
         )
 
+        # --- ETA bookkeeping ---
         self._eta_window = deque(maxlen=20)
         self._last_log_time = time.time()
         self._last_log_step = 0
+        self._val_event_durations = []               # seconds per validation event (rolling history)
+        self._val_avg_seconds = 0.0                  # running average
 
         print(f"[DEBUG] Trainer: white_bkgd={bool(getattr(cfg,'white_bkgd',True))}  vanilla={self.vanilla}")
 
@@ -325,6 +328,7 @@ class Trainer:
         self._val_step_set = set(self.val_steps)
         self._val_next_idx = 0
         self._val_next_step = self.val_steps[0] if self.val_steps else None
+        self._val_remaining_steps = len(self.val_steps)
         if self._val_next_step is not None:
             print(f"[VAL] first validation at step {self._val_next_step} (1/{len(self.val_steps)})")
 
@@ -522,20 +526,42 @@ class Trainer:
 
             # Logs
             if step % log_every == 0:
-                now = time.time(); secs = now - self._last_log_time
+                now = time.time()
+                secs = now - self._last_log_time
                 steps_delta = step - (self._last_log_step or 0) or 1
                 sec_per_step = secs / steps_delta
                 self._eta_window.append(sec_per_step)
                 avg_sec_per_step = sum(self._eta_window) / len(self._eta_window)
+
+                # TRAIN-ONLY ETA
+                max_steps = int(getattr(self.cfg, "max_steps", 0) or 0)
                 steps_left = max(0, max_steps - step)
-                eta_sec = steps_left * avg_sec_per_step
-                eta_h = int(eta_sec // 3600); eta_m = int((eta_sec % 3600) // 60); eta_s = int(eta_sec % 60)
-                eta_str = f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
-                print(f"[{step:>7d}] loss={loss_val:.6f} psnr={psnr_val:.2f} lr={self.opt.param_groups[0]['lr']:.2e} "
-                      f"({secs:.2f}s/{steps_delta} steps, {sec_per_step:.3f}s/step avg {avg_sec_per_step:.3f}s) ETA {eta_str}")
+                eta_train_sec = steps_left * avg_sec_per_step
+
+                # VALIDATION ETA (remaining events × avg seconds per event)
+                rem_val_events = self._val_remaining_steps
+                avg_val_sec = float(self._val_avg_seconds or 0.0)
+                eta_val_sec = rem_val_events * avg_val_sec
+
+                # TOTAL ETA = training + future validation
+                eta_total_sec = eta_train_sec + eta_val_sec
+
+                def _fmt_eta(seconds: float) -> str:
+                    h = int(seconds // 3600)
+                    m = int((seconds % 3600) // 60)
+                    s = int(seconds % 60)
+                    return f"{h:02d}:{m:02d}:{s:02d}"
+
+                print(
+                    f"[{step:7d}] loss={loss_val:.6f} psnr={psnr_val:.2f} "
+                    f"lr={self.opt.param_groups[0]['lr']:.2e} "
+                    f"({secs:.2f}s/{steps_delta} steps, {sec_per_step:.3f}s/step avg {avg_sec_per_step:.3f}s) "
+                    f"ETA(train) {_fmt_eta(eta_train_sec)} | ETA(total) {_fmt_eta(eta_total_sec)}"
+                )
 
             # Validation (dense-early schedule)
             if self._val_next_step is not None and step == self._val_next_step:
+                val_t0 = time.perf_counter()
                 self.nerf_c.eval(); self.nerf_f.eval()
                 with torch.no_grad():
                     self.valr.tb = (self.tb_logger if getattr(self, "tb_logger", None) else None)
@@ -551,10 +577,16 @@ class Trainer:
                             print(f"[PROGRESS] wrote progress frames [{start_idx}..{start_idx+count-1}]")
                 self.nerf_c.train(); self.nerf_f.train()
 
+                # Measure and update rolling validation-time average
+                val_secs = max(0.0, time.perf_counter() - val_t0)
+                self._val_event_durations.append(val_secs)
+                # Use last K to smooth; K=10 is a nice default
+                recent_val_event_durations = self._val_event_durations[-10:]
+                self._val_avg_seconds = float(sum(recent_val_event_durations) / max(1, len(recent_val_event_durations)))
                 # advance to the next scheduled validation step
                 self._val_next_idx += 1
-                self._val_next_step = self.val_steps[self._val_next_idx] \
-                    if self._val_next_idx < len(self.val_steps) else None
+                self._val_next_step = self.val_steps[self._val_next_idx] if self._val_next_idx < len(self.val_steps) else None
+                self._val_remaining_steps = len(self.val_steps[self._val_next_idx:])
                 if self._val_next_step is not None:
                     print(f"[VAL] next validation at step {self._val_next_step} "
                         f"({self._val_next_idx+1}/{len(self.val_steps)})")
