@@ -111,9 +111,8 @@ Common knobs:
 - `--progress_video_during_training --progress_frames 300`
 - `--render_path_after --path_frames 300 --path_type {circle,spiral}`
 
----
 
-## What “vanilla” flips under the hood
+**What `--vanilla` flips under the hood:**
 
 - Encoders: Lx=10 (pos), Ld=4 (dir); include original inputs.
 - Model: 8×256 with mid-skip; ReLU σ, raw σ noise during training.
