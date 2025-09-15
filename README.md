@@ -11,10 +11,10 @@ The custom Trainer class includes a wide suite of quality-of-life features such 
 
 As the intent of this project is to learn more about neural radiance fields and how they work, many visualization features have been added, including:
 
+- Camera path rendering for novel scene generation, both during training and after
 - Rendering of RGB, depth, and opacity as the model learns the scene
 - Comprehensive validation scheduling to generate *training progress videos* that can be linear or power-based to generate more frames at earlier stages.
-  - An example can be found here as a [YouTube Short](https://youtube.com/shorts/a5gZcdhjUwg?si=MgS1kwodNKym28jo)
-- Camera path rendering for novel scene generation, both during training and after
+  - An example training progress video made from this code can be found here on [YouTube](https://youtu.be/EJCblYlA6Tk?si=7lgSbz1_i9fpVDWA)
 
 
 ## Features
