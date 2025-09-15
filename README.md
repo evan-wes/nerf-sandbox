@@ -1,30 +1,31 @@
-# NeRF (vanilla-compatible) — with validation tools, progress video, and robust training
+# A Neural Radiance Field Sandbox
 
-This project is a refactor of a NeRF training pipeline with a focus on **exact vanilla NeRF behavior** (bmild/nerf) when `--vanilla` is set, plus quality-of-life features for long runs: auto-resume, staged validation rendering (including a *training progress video* built during training), GPU thermal safeguards, and controllable signal handling.
+This project contains a PyTorch implementation of a Neural Radiance Field (NeRF) model with the aim of expandability to more advanced architectures and training paradigms. The initial version supports the [original paper's architecture](https://www.matthewtancik.com/nerf).
 
-The code assumes the **Blender synthetic** dataset layout and reads image paths *exactly* from `transforms_{split}.json` (e.g., `"./train/r_0"` → `<root>/train/r_0.png`). Camera ray generation and pose utilities are **convention-aware** and match the dataset’s OpenGL-style transforms.
+The custom Trainer class includes a wide suite of quality-of-life features such as:
 
----
+- Auto-resume functionality to pause training and restart from the latest or a specific checkpoint
+- GPU thermal safeguards helpful for laptops
+- Signal handling to gracefully quit if training is interupted with Ctrl+C
+- Comprehensive logging via TensorBoard, with loss, metrics, and validation images
 
-## Preview (YouTube)
+As the intent of this project is to learn more about neural radiance fields and how they work, many visualization features have been added, including:
 
+- Rendering of RGB, depth, and opacity as the model learns the scene
+- Comprehensive validation scheduling to generate *training progress videos* that can be linear or power-based to generate more frames at earlier stages.
+  - An example can be found here as a [YouTube Short](https://youtube.com/shorts/a5gZcdhjUwg?si=MgS1kwodNKym28jo)
+- Camera path rendering for novel scene generation, both during training and after
 
-<iframe width="560" height="315" src="https://youtube.com/shorts/a5gZcdhjUwg?si=YDkZmCX-dQ5efv_Y" title="NeRF training progress" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
-
-
----
 
 ## Features
 
 - **Vanilla NeRF parity** (`--vanilla`)
-  - 8×256 MLP with skip, positional encoders (Lx=10 / Ld=4), ReLU σ with raw noise, white background, bmild sampling (1024 rays, center-precrop warmup), etc.
+  - 8×256 MLP with a skip connection, positional encoders (Lx=10 / Ld=4), ReLU σ with raw noise, white background, sampling (1024 rays, center-precrop warmup), etc.
 - **Validation & visualization**
   - Select per-view validation via `--val_indices`.
   - Save **RGB / opacity / depth** per validation step.
   - **Training progress video**: one smooth camera path is precomputed and **rendered block-by-block during training**, matched to a user-defined validation schedule (e.g., dense early via power law).
   - Camera path generation is **convention-aware** and supports **circle** and **spiral**.
-- **Schedules that match how models learn**
-  - Validation events can follow a **power schedule** (dense early, sparse later) while the progress video keeps a **constant angular speed**.
 - **Auto-resume & robust checkpoints**
   - Resume from latest or explicit checkpoint; validation plan/progress state is restored so progress video continues where it left off.
 - **GPU thermal guard**
@@ -51,8 +52,9 @@ File paths in the JSON are used **as-is**, with “.png” appended.
 
 ### 2) Train on LEGO with vanilla settings
 
-# from the repo root
-python nerf_experiments/source/scripts/train_nerf.py \
+#### from the repo root
+```
+$ python nerf_experiments/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
@@ -64,7 +66,7 @@ python nerf_experiments/source/scripts/train_nerf.py \
   --val_indices 0,3,11 \
   --progress_video_during_training --progress_frames 300 \
   --render_path_after --path_frames 300 --path_type spiral
-
+```
 Notes:
 - If you hit OOM during validation, try `--eval_chunk 2048` (or 1024) and/or `--val_res_scale 0.5`.
 - CUDA fragmentation? The trainer sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` automatically.
@@ -72,22 +74,24 @@ Notes:
 ### 3) Resuming training
 
 **Auto-resume (find latest checkpoint in the run directory):**
-
+```
 python nerf_experiments/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
   --auto_resume \
   --use_tb
+```
 
 **Or resume from a specific file:**
-
+```
 python nerf_experiments/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
   --resume_path /path/to/exp/lego_vanilla/checkpoints/ckpt_0005000.pt \
   --use_tb
+```
 
 On resume, the **validation schedule** and **progress-video state** are reloaded so the next validation block and progress frames continue exactly where they should.
 
@@ -121,4 +125,4 @@ Common knobs:
 
 ## Acknowledgements
 
-- Original NeRF: https://github.com/bmild/nerf
+- The "vanilla" mode is based off of the original NeRF paper: https://github.com/bmild/nerf
