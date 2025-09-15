@@ -20,9 +20,9 @@ import torch.nn.functional as F
 import imageio.v2 as imageio
 from tqdm import tqdm
 
-from nerf_experiments.source.data.scene import Scene
-from nerf_experiments.source.utils.sampling_utils import sample_pdf
-from nerf_experiments.source.utils.ray_utils import get_camera_rays
+from nerf_sandbox.source.data.scene import Scene
+from nerf_sandbox.source.utils.sampling_utils import sample_pdf
+from nerf_sandbox.source.utils.ray_utils import get_camera_rays
 
 
 # ------------------------- Colorspace -------------------------

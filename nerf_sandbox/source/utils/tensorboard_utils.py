@@ -21,7 +21,7 @@ try:
 except Exception:  # pragma: no cover
     SummaryWriter = None  # type: ignore
 
-from nerf_experiments.source.utils.render_utils import linear_to_srgb
+from nerf_sandbox.source.utils.render_utils import linear_to_srgb
 
 
 class TensorBoardLogger:

@@ -42,10 +42,10 @@ else:
     raise Exception(f"Module not compatible with Python{str(python_version_major)+'.'+str(python_version_minor)}")
 
 setuptools.setup(
-    name='nerf_experiments',
-    version=read_version("nerf_experiments/version.py"),
+    name='nerf_sandbox',
+    version=read_version("nerf_sandbox/version.py"),
     description='Package containing python implementations of NeRF MLPs and training code',
-    long_description='Package containing python implementations of NeRF MLPs and training code',
+    long_description='Package containing python implementations of NeRF MLPs and training code suitable for experimentation',
     long_description_content_type='text/markdown',
     keywords='common',
     packages=find_packages(exclude='configs'),

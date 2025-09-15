@@ -12,8 +12,8 @@ import argparse
 from types import SimpleNamespace
 from pathlib import Path
 
-from nerf_experiments.source.train.trainer import Trainer
-from nerf_experiments.source.utils.validation_renderer import ValidationRenderer
+from nerf_sandbox.source.train.trainer import Trainer
+from nerf_sandbox.source.utils.validation_renderer import ValidationRenderer
 
 
 def make_cfg_from_args(args: argparse.Namespace) -> SimpleNamespace:

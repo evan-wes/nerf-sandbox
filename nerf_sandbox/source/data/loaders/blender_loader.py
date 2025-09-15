@@ -20,7 +20,7 @@ from typing import List
 import numpy as np
 import imageio.v2 as imageio
 
-from nerf_experiments.source.data.scene import Frame, Scene
+from nerf_sandbox.source.data.scene import Frame, Scene
 
 
 class BlenderSceneLoader:

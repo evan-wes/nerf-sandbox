@@ -54,7 +54,7 @@ File paths in the JSON are used **as-is**, with “.png” appended.
 
 #### from the repo root
 ```
-$ python nerf_experiments/source/scripts/train_nerf.py \
+$ python nerf_sandbox/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
@@ -75,7 +75,7 @@ Notes:
 
 **Auto-resume (find latest checkpoint in the run directory):**
 ```
-python nerf_experiments/source/scripts/train_nerf.py \
+python nerf_sandbox/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
@@ -85,7 +85,7 @@ python nerf_experiments/source/scripts/train_nerf.py \
 
 **Or resume from a specific file:**
 ```
-python nerf_experiments/source/scripts/train_nerf.py \
+python nerf_sandbox/source/scripts/train_nerf.py \
   --data_root /path/to/nerf_synthetic/lego \
   --out_dir   /path/to/exp/lego_vanilla \
   --vanilla \
@@ -101,7 +101,7 @@ On resume, the **validation schedule** and **progress-video state** are reloaded
 
 Show all options:
 
-python nerf_experiments/source/scripts/train_nerf.py --help
+python nerf_sandbox/source/scripts/train_nerf.py --help
 
 Common knobs:
 - `--rays_per_batch`, `--nc`, `--nf`, `--raw_noise_std`, `--sigma_activation`

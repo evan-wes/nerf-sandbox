@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import imageio.v2 as imageio
 
-from nerf_experiments.source.utils.render_utils import (
+from nerf_sandbox.source.utils.render_utils import (
     render_image_chunked,
     render_pose,
     linear_to_srgb,

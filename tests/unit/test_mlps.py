@@ -3,7 +3,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nerf_experiments.source.models.mlps import NeRF
+from nerf_sandbox.source.models.mlps import NeRF
 
 
 def _count_params(m: nn.Module) -> int:
