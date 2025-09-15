@@ -36,6 +36,10 @@ As the intent of this project is to learn more about neural radiance fields and 
 - **TensorBoard logging**
   - Scalars + images (RGB/opacity/depth). Works across resumes (same log dir).
 
+Example of the training progress video generation using a power-law validation schedule to render more frames along the path at earlier training iterations:
+
+![Demo](assets/training_progress_demo.gif)
+
 ---
 
 ## Quick start
