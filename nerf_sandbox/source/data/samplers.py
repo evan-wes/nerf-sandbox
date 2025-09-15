@@ -11,7 +11,7 @@ from typing import Iterator, Dict, Optional
 
 import torch
 
-from nerf_experiments.source.utils.render_utils import get_camera_rays
+from nerf_sandbox.source.utils.render_utils import get_camera_rays
 
 
 # Minimal protocol Scene/Frame:

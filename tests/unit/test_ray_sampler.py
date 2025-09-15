@@ -6,9 +6,9 @@ import pytest
 import torch
 from PIL import Image
 
-from nerf_experiments.source.data.scene import Frame, Scene
-from nerf_experiments.source.data.loaders.blender_loader import BlenderSceneLoader
-from nerf_experiments.source.data.samplers import RandomPixelRaySampler
+from nerf_sandbox.source.data.scene import Frame, Scene
+from nerf_sandbox.source.data.loaders.blender_loader import BlenderSceneLoader
+from nerf_sandbox.source.data.samplers import RandomPixelRaySampler
 
 
 def _write_png(path: Path, arr: np.ndarray) -> None:

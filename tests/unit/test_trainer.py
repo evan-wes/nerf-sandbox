@@ -8,9 +8,9 @@ import torch
 from PIL import Image
 
 
-from nerf_experiments.source.config.config_utils import parse_nerf_config, NerfConfig, DataConfig, CameraConfig, TrainSection, RenderConfig, EncodingConfig, PEConfig
-from nerf_experiments.source.config.runtime_config import to_runtime_train_config, RuntimeTrainConfig
-from nerf_experiments.source.train.trainer import Trainer
+from nerf_sandbox.source.config.config_utils import parse_nerf_config, NerfConfig, DataConfig, CameraConfig, TrainSection, RenderConfig, EncodingConfig, PEConfig
+from nerf_sandbox.source.config.runtime_config import to_runtime_train_config, RuntimeTrainConfig
+from nerf_sandbox.source.train.trainer import Trainer
 
 
 # ---------- helpers ----------
@@ -169,7 +169,7 @@ def test_hierarchical_sampling_calls_pdf(monkeypatch, tiny_blender):
         return bins[:, torch.linspace(0, M-1, steps=n_samples).long()]
 
     # Patch the symbol used inside trainer
-    monkeypatch.setattr("nerf_experiments.source.train.trainer.sample_pdf", fake_sample_pdf, raising=True)
+    monkeypatch.setattr("nerf_sandbox.source.train.trainer.sample_pdf", fake_sample_pdf, raising=True)
 
     batch = next(iter(tr.sampler))
     _ = tr.train_step(batch)

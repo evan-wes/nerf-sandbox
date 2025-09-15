@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from nerf_experiments.source.utils.torch_utils import to_torch
+from nerf_sandbox.source.utils.torch_utils import to_torch
 
 def get_camera_rays(
     image_h: int,

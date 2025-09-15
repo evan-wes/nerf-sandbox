@@ -40,23 +40,23 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # Local imports
-from nerf_experiments.source.data.loaders.blender_loader import BlenderSceneLoader
-from nerf_experiments.source.data.samplers import RandomPixelRaySampler
-from nerf_experiments.source.models.encoders import PositionalEncoder, get_vanilla_nerf_encoders
-from nerf_experiments.source.models.mlps import NeRF
-from nerf_experiments.source.utils.render_utils import (
+from nerf_sandbox.source.data.loaders.blender_loader import BlenderSceneLoader
+from nerf_sandbox.source.data.samplers import RandomPixelRaySampler
+from nerf_sandbox.source.models.encoders import PositionalEncoder, get_vanilla_nerf_encoders
+from nerf_sandbox.source.models.mlps import NeRF
+from nerf_sandbox.source.utils.render_utils import (
     volume_render_rays,
     srgb_to_linear, linear_to_srgb,
     save_rgb_png, save_gray_png,
     render_image_chunked, render_pose
 )
-from nerf_experiments.source.utils.ray_utils import get_camera_rays
-from nerf_experiments.source.utils.sampling_utils import sample_pdf
-from nerf_experiments.source.utils.gpu_thermal import GpuThermalManager
-from nerf_experiments.source.utils.signal_handlers import SignalController, install_signal_handlers
-from nerf_experiments.source.utils.tensorboard_utils import TensorBoardLogger
-from nerf_experiments.source.utils.validation_renderer import ValidationRenderer
-from nerf_experiments.source.utils.validation_schedule import build_validation_steps
+from nerf_sandbox.source.utils.ray_utils import get_camera_rays
+from nerf_sandbox.source.utils.sampling_utils import sample_pdf
+from nerf_sandbox.source.utils.gpu_thermal import GpuThermalManager
+from nerf_sandbox.source.utils.signal_handlers import SignalController, install_signal_handlers
+from nerf_sandbox.source.utils.tensorboard_utils import TensorBoardLogger
+from nerf_sandbox.source.utils.validation_renderer import ValidationRenderer
+from nerf_sandbox.source.utils.validation_schedule import build_validation_steps
 
 
 # -----------------------------------------------------------------------------

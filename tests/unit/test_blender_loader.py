@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from nerf_experiments.source.data.scene import Frame, Scene
-from nerf_experiments.source.data.loaders.blender_loader import BlenderSceneLoader
+from nerf_sandbox.source.data.scene import Frame, Scene
+from nerf_sandbox.source.data.loaders.blender_loader import BlenderSceneLoader
 
 
 def _write_png(path: Path, arr: np.ndarray) -> None:
