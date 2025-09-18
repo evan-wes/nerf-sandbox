@@ -60,23 +60,38 @@ class RandomPixelRaySampler(RaySampler):
         Number of initial iterations to use center precropping.
     precrop_frac : float
         Fraction of the image side length used for the center crop (0<frac<=1).
+    convention : str
+        Convention for ray generation. Ex. "opengl" or "colmap"
+    as_ndc : bool, optional
+        Whether to return rays in NDC. Defaults to False
+    near_plane : float, optional
+        The near plane to use when generating camera rays. defaults to 1.0
+
     """
 
-    def __init__(self,
-                 scene,
-                 rays_per_batch: int = 2048,
-                 device: str | torch.device | None = None,
-                 white_bg_composite: Optional[bool] = None,
-                 cache_images_on_device: bool = False,
-                 sample_from_single_frame: bool = False,
-                 precrop_iters: int = 0,
-                 precrop_frac: float = 0.5) -> None:
+    def __init__(
+        self,
+        scene,
+        rays_per_batch: int = 2048,
+        device: str | torch.device | None = None,
+        white_bg_composite: Optional[bool] = None,
+        cache_images_on_device: bool = False,
+        sample_from_single_frame: bool = False,
+        precrop_iters: int = 0,
+        precrop_frac: float = 0.5,
+        convention: str = "opengl",
+        as_ndc: bool = False,
+        near_plane: float = 1.0
+    ) -> None:
 
         self.scene = scene
         self.B = int(rays_per_batch)
         self.device = torch.device(device) if device is not None else None
         self.white_bkgd = scene.white_bkgd if white_bg_composite is None else bool(white_bg_composite)
         self.cache = bool(cache_images_on_device)
+        self.convention = convention
+        self.as_ndc = as_ndc
+        self.near_plane = near_plane
 
         # Sampling behavior toggles
         self.sample_from_single_frame = bool(sample_from_single_frame)
@@ -143,7 +158,9 @@ class RandomPixelRaySampler(RaySampler):
                 # Build rays for this frame
                 pixels_xy = torch.stack([xs.to(torch.float32), ys.to(torch.float32)], dim=-1)
                 rays_o, rays_d = get_camera_rays(self.H, self.W, K, c2w,
-                                                 device=self.device, pixels_xy=pixels_xy)
+                                                 device=self.device, pixels_xy=pixels_xy,
+                                                 convention=self.convention,
+                                                 as_ndc=self.as_ndc, near_plane=self.near_plane)
 
                 # Gather RGB targets (composite if RGBA and white_bkgd)
                 pix = img[ys.long(), xs.long()]
@@ -171,7 +188,9 @@ class RandomPixelRaySampler(RaySampler):
 
                     px = torch.stack([xs[mask].to(torch.float32), ys[mask].to(torch.float32)], dim=-1)
                     ro, rd = get_camera_rays(self.H, self.W, K, c2w,
-                                             device=self.device, pixels_xy=px)
+                                             device=self.device, pixels_xy=px,
+                                             convention=self.convention,
+                                             as_ndc=self.as_ndc, near_plane=self.near_plane)
 
                     pix = img[ys[mask].long(), xs[mask].long()]
                     rgb = self._composite_rgb(pix)

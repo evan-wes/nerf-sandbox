@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import imageio.v2 as imageio
 
+from nerf_sandbox.source.utils.validation_schedule import build_validation_steps
 from nerf_sandbox.source.utils.render_utils import (
     render_image_chunked,
     render_pose,
@@ -42,14 +43,17 @@ class ValidationRenderer:
         self.device = trainer.device
         self.near = float(getattr(trainer, "near", 2.0))
         self.far = float(getattr(trainer, "far", 6.0))
+        self.use_ndc = bool(getattr(trainer, "use_ndc", getattr(trainer.cfg, "as_ndc", False)))
+        self.ndc_near_plane_world = float(getattr(trainer, "ndc_near_plane_world", getattr(trainer, "near", 1.0)))
         self.scene = trainer.val_scene
         self.out_dir = Path(out_dir) if out_dir else (Path(trainer.out_dir) / "validation")
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.tb = tb_logger
+        self.convention = getattr(trainer, "camera_convention", "opengl")
 
         # Eval defaults
-        self.eval_nc = int(getattr(trainer, "eval_nc", getattr(trainer.cfg, "eval_nc", 0)) or getattr(trainer, "nc", 64))
-        self.eval_nf = int(getattr(trainer, "eval_nf", getattr(trainer.cfg, "eval_nf", 0)) or getattr(trainer, "nf", 128))
+        self.nc_eval = int(getattr(trainer, "nc_eval", getattr(trainer.cfg, "nc_eval", 0)) or getattr(trainer, "nc", 64))
+        self.nf_eval = int(getattr(trainer, "nf_eval", getattr(trainer.cfg, "nf_eval", 0)) or getattr(trainer, "nf", 128))
         self.eval_chunk = int(getattr(trainer, "eval_chunk", getattr(trainer.cfg, "eval_chunk", 2048)))
         self.white_bkgd = bool(getattr(trainer.cfg, "white_bkgd", True))
         self.sigma_activation = "relu" if bool(getattr(trainer, "vanilla", False)) \
@@ -160,16 +164,25 @@ class ValidationRenderer:
 
             rays_o, rays_d = get_camera_rays(
                 image_h=H, image_w=W, intrinsic_matrix=K, transform_camera_to_world=fr.c2w,
-                device=self.device, dtype=torch.float32, normalize_dirs=True, as_ndc=False,
-                near_plane=self.near, pixels_xy=None,
+                device=self.device, dtype=torch.float32, normalize_dirs=True,
+                as_ndc=self.use_ndc,
+                near_plane=(self.ndc_near_plane_world if self.use_ndc else self.near),
+                pixels_xy=None,
+                convention=self.convention,
             )
+
+            # Choose near/far for sampling (NOT the NDC near plane)
+            if self.use_ndc:
+                near_render, far_render = 0.0, 1.0
+            else:
+                near_render, far_render = self.near, self.far
 
             res = render_image_chunked(
                 rays_o=rays_o, rays_d=rays_d, H=H, W=W,
-                near=self.near, far=self.far,
+                near=near_render, far=far_render,
                 pos_enc=self.tr.pos_enc, dir_enc=self.tr.dir_enc,
                 nerf_c=self.tr.nerf_c, nerf_f=self.tr.nerf_f,
-                nc_eval=self.eval_nc, nf_eval=self.eval_nf,
+                nc_eval=self.nc_eval, nf_eval=self.nf_eval,
                 white_bkgd=self.white_bkgd, device=self.device,
                 eval_chunk=self.eval_chunk, perturb=False,
                 raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
@@ -178,7 +191,10 @@ class ValidationRenderer:
             rgb_lin = res["rgb"]
             acc = res["acc"].squeeze(-1)
             depth = res["depth"].squeeze(-1)
-            depth_norm = ((depth - self.near) / (self.far - self.near + 1e-8)).clamp(0, 1)
+            if self.use_ndc:
+                depth_norm = depth.clamp(0, 1)
+            else:
+                depth_norm = ((depth - self.near) / (self.far - self.near + 1e-8)).clamp(0, 1)
             rgb_srgb = linear_to_srgb(rgb_lin)
 
             p_rgb   = self.out_dir / f"val_idx{fid:04d}.png"
@@ -238,16 +254,25 @@ class ValidationRenderer:
 
             rays_o, rays_d = get_camera_rays(
                 image_h=H, image_w=W, intrinsic_matrix=K, transform_camera_to_world=fr.c2w,
-                device=self.device, dtype=torch.float32, normalize_dirs=True, as_ndc=False,
-                near_plane=self.near, pixels_xy=None,
+                device=self.device, dtype=torch.float32, normalize_dirs=True,
+                as_ndc=self.use_ndc,
+                near_plane=(self.ndc_near_plane_world if self.use_ndc else self.near),
+                pixels_xy=None,
+                convention=self.convention,
             )
+
+            # Choose near/far for sampling (NOT the NDC near plane)
+            if self.use_ndc:
+                near_render, far_render = 0.0, 1.0
+            else:
+                near_render, far_render = self.near, self.far
 
             res = render_image_chunked(
                 rays_o=rays_o, rays_d=rays_d, H=H, W=W,
-                near=self.near, far=self.far,
+                near=near_render, far=far_render,
                 pos_enc=self.tr.pos_enc, dir_enc=self.tr.dir_enc,
                 nerf_c=self.tr.nerf_c, nerf_f=self.tr.nerf_f,
-                nc_eval=self.eval_nc, nf_eval=self.eval_nf,
+                nc_eval=self.nc_eval, nf_eval=self.nf_eval,
                 white_bkgd=self.white_bkgd, device=self.device,
                 eval_chunk=self.eval_chunk, perturb=False,
                 raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
@@ -256,7 +281,10 @@ class ValidationRenderer:
             rgb_lin = res["rgb"]
             acc = res["acc"].squeeze(-1)               # accumulated opacity (density projection)
             depth = res["depth"].squeeze(-1)
-            depth_norm = ((depth - self.near) / (self.far - self.near + 1e-8)).clamp(0, 1)
+            if self.use_ndc:
+                depth_norm = depth.clamp(0, 1)
+            else:
+                depth_norm = ((depth - self.near) / (self.far - self.near + 1e-8)).clamp(0, 1)
             rgb_srgb = linear_to_srgb(rgb_lin)
 
             # Per-index subdirs
@@ -398,6 +426,7 @@ class ValidationRenderer:
             yaw_range_deg=float(yaw_range_deg),
             res_scale=float(res_scale),
             world_up=world_up,
+            convention=self.convention
         )
 
         # ----------------------------
@@ -438,6 +467,10 @@ class ValidationRenderer:
         start_idx = sum(self._prog_block_sizes[:block_idx])
         end_idx = start_idx + count
 
+        # choose the NDC ray-warp plane (world units) and sampling bounds
+        near_plane_world = self.ndc_near_plane_world if self.use_ndc else self.near
+        samp_near, samp_far = (0.0, 1.0) if self.use_ndc else (self.near, self.far)
+
         for i in tqdm(range(start_idx, end_idx),
                       desc=f"[PROGRESS] block {block_idx+1}/{len(self._prog_block_sizes)}"):
             p = self._prog_frames_dir / f"frame_{i:05d}.png"
@@ -448,13 +481,19 @@ class ValidationRenderer:
             self.tr.nerf_c.eval(); self.tr.nerf_f.eval()
             rgb_lin = render_pose(
                 c2w=c2w, H=self._prog_H, W=self._prog_W, K=self._prog_K,
+                # world-space near/far (kept for backward-compat)
                 near=self.near, far=self.far,
+                # model bits
                 pos_enc=self.tr.pos_enc, dir_enc=self.tr.dir_enc,
                 nerf_c=self.tr.nerf_c, nerf_f=self.tr.nerf_f,
                 device=self.device, white_bkgd=self.white_bkgd,
-                eval_nc=self.eval_nc, eval_nf=self.eval_nf,
-                eval_chunk=self.eval_chunk, perturb=False,
-                raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                nc_eval=self.nc_eval, nf_eval=self.nf_eval, eval_chunk=self.eval_chunk,
+                perturb=False, raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                # NEW: explicit ray and sampling controls
+                use_ndc=self.use_ndc,
+                convention=self.convention,
+                near_plane=near_plane_world,     # world-space plane for NDC warp
+                samp_near=samp_near, samp_far=samp_far,  # sampling interval (0..1 for NDC)
             )
             rgb_srgb = linear_to_srgb(rgb_lin)
             p = self._prog_frames_dir / f"frame_{i:05d}.png"
@@ -492,11 +531,21 @@ class ValidationRenderer:
         """
         # Ensure we have a plan/poses
         if not getattr(self, "_prog_poses", None):
+            # Build when there is no plan: derive a validation schedule, then plan
+            max_steps = int(getattr(self.tr.cfg, "max_steps", 200_000))
+            # prefer an explicit schedule if present; else uniform-ish:
+            val_every = getattr(self.tr.cfg, "val_every", None)
+            if val_every is not None and int(val_every) > 0:
+                val_steps = build_validation_steps(max_steps, base_every=int(val_every))
+            else:
+                num_val_steps = int(getattr(self.tr.cfg, "num_val_steps", 100))
+                power = float(getattr(self.tr.cfg, "val_power", 2.0))
+                val_steps = build_validation_steps(max_steps, num_val_steps=num_val_steps,
+                                                schedule="power", power=power)
+
             self.setup_progress_plan(
-                max_steps=int(getattr(self.tr.cfg, "max_steps", 200_000)),
-                val_every=int(getattr(self.tr.cfg, "val_every", 1000)),
+                val_steps=val_steps,
                 n_frames=int(getattr(self.tr.cfg, "path_frames", 120)),
-                num_events=1,  # not used here, but required by signature
                 path_type=str(getattr(self.tr.cfg, "path_type", "circle")),
                 radius=getattr(self.tr.cfg, "path_radius", None),
                 elevation_deg=float(getattr(self.tr.cfg, "path_elev_deg", 10.0)),
@@ -504,7 +553,7 @@ class ValidationRenderer:
                 res_scale=float(getattr(self.tr.cfg, "path_res_scale", 1.0)),
                 fps=int(getattr(self.tr.cfg, "path_fps", 24)),
                 world_up=None,
-                frames_subdir="progress_by_val",  # internal; we won't use it for final frames
+                frames_subdir="progress_by_val",
             )
 
         # Where to put final frames
@@ -515,19 +564,26 @@ class ValidationRenderer:
                 except Exception: pass
         frames_dir.mkdir(parents=True, exist_ok=True)
 
+        near_plane_world = self.ndc_near_plane_world if self.use_ndc else self.near
+        samp_near, samp_far = (0.0, 1.0) if self.use_ndc else (self.near, self.far)
+
         # Render all frames (RGB) with the *final* model
         for i in tqdm(range(len(self._prog_poses)), desc="[FINAL PATH] frames"):
             c2w = self._prog_poses[i]
             self.tr.nerf_c.eval(); self.tr.nerf_f.eval()
             rgb_lin = render_pose(
-                c2w=c2w, H=self._prog_H, W=self._prog_W, K=self._prog_K,
-                near=self.near, far=self.far,
+                c2w=c2w, H=H, W=W, K=K,
+                near=self.near, far=self.far,  # world-space, kept for compat
                 pos_enc=self.tr.pos_enc, dir_enc=self.tr.dir_enc,
                 nerf_c=self.tr.nerf_c, nerf_f=self.tr.nerf_f,
                 device=self.device, white_bkgd=self.white_bkgd,
-                eval_nc=self.eval_nc, eval_nf=self.eval_nf,
-                eval_chunk=self.eval_chunk, perturb=False,
-                raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                nc_eval=self.nc_eval, nf_eval=self.nf_eval, eval_chunk=self.eval_chunk,
+                perturb=False, raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                # NEW: explicit ray + sampling controls
+                use_ndc=self.use_ndc,
+                convention=self.convention,
+                near_plane=near_plane_world,
+                samp_near=samp_near, samp_far=samp_far,
             )
             rgb_srgb = linear_to_srgb(rgb_lin)
             save_rgb_png(rgb_srgb, frames_dir / f"frame_{i:05d}.png")
@@ -578,18 +634,26 @@ class ValidationRenderer:
             convention=str(convention),
         )
 
+        near_plane_world = self.ndc_near_plane_world if self.use_ndc else self.near
+        samp_near, samp_far = (0.0, 1.0) if self.use_ndc else (self.near, self.far)
+
         # Render frames
         frame_paths: List[Path] = []
+        self.tr.nerf_c.eval(); self.tr.nerf_f.eval()
         for i, c2w in enumerate(tqdm(poses, desc="Final camera path")):
             rgb_lin = render_pose(
                 c2w=c2w, H=H, W=W, K=K,
-                near=self.near, far=self.far,
+                near=self.near, far=self.far,  # world-space, kept for compat
                 pos_enc=self.tr.pos_enc, dir_enc=self.tr.dir_enc,
                 nerf_c=self.tr.nerf_c, nerf_f=self.tr.nerf_f,
                 device=self.device, white_bkgd=self.white_bkgd,
-                eval_nc=self.eval_nc, eval_nf=self.eval_nf,
-                eval_chunk=self.eval_chunk, perturb=False,
-                raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                nc_eval=self.nc_eval, nf_eval=self.nf_eval, eval_chunk=self.eval_chunk,
+                perturb=False, raw_noise_std=self.raw_noise_std, sigma_activation=self.sigma_activation,
+                # NEW: explicit ray + sampling controls
+                use_ndc=self.use_ndc,
+                convention=convention,          # use the function arg
+                near_plane=near_plane_world,
+                samp_near=samp_near, samp_far=samp_far,
             )
             p = out_dir / f"frame_{i:05d}.png"
             save_rgb_png(linear_to_srgb(rgb_lin), p)

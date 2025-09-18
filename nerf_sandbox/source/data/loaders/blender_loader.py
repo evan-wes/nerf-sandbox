@@ -37,6 +37,7 @@ class BlenderSceneLoader:
         self.scene_scale = float(scene_scale)
         self.center_origin = bool(center_origin)
         self.composite_on_load = bool(composite_on_load)
+        self.camera_convention = "opengl"
 
     def _imread_float(self, path: Path) -> np.ndarray:
         img = imageio.imread(path).astype(np.float32) / 255.0

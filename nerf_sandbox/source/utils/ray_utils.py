@@ -1,5 +1,6 @@
 """Utilities for generating camera rays for rendering scenes"""
 
+from __future__ import annotations
 import numpy as np
 import torch
 

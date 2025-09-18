@@ -41,16 +41,15 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Local imports
 from nerf_sandbox.source.data.loaders.blender_loader import BlenderSceneLoader
+from nerf_sandbox.source.data.loaders.llff_loader import LLFFSceneLoader
 from nerf_sandbox.source.data.samplers import RandomPixelRaySampler
 from nerf_sandbox.source.models.encoders import PositionalEncoder, get_vanilla_nerf_encoders
 from nerf_sandbox.source.models.mlps import NeRF
 from nerf_sandbox.source.utils.render_utils import (
     volume_render_rays,
     srgb_to_linear, linear_to_srgb,
-    save_rgb_png, save_gray_png,
-    render_image_chunked, render_pose
+    save_rgb_png, save_gray_png
 )
-from nerf_sandbox.source.utils.ray_utils import get_camera_rays
 from nerf_sandbox.source.utils.sampling_utils import sample_pdf
 from nerf_sandbox.source.utils.gpu_thermal import GpuThermalManager
 from nerf_sandbox.source.utils.signal_handlers import SignalController, install_signal_handlers
@@ -121,14 +120,40 @@ class Trainer:
         set_global_seed(int(getattr(cfg, "seed", 42)))
 
         # ---- Data ----
-        self.loader = BlenderSceneLoader(
-            root=cfg.data_root,
-            downscale=int(getattr(cfg, "downscale", 1)),
-            white_bkgd=bool(getattr(cfg, "white_bkgd", True)),
-            scene_scale=float(getattr(cfg, "scene_scale", 1.0)),
-            center_origin=bool(getattr(cfg, "center_origin", False)),
-            composite_on_load=bool(getattr(cfg, "composite_on_load", True)),
-        )
+        data_kind = str(getattr(cfg, "data_kind", "auto")).lower()
+
+        if data_kind == "auto":
+            is_llff = (Path(cfg.data_root) / "poses_bounds.npy").exists()
+        elif data_kind == "llff":
+            is_llff = True
+        else:
+            is_llff = False
+
+        if is_llff:
+            # LLFF
+            self.loader = LLFFSceneLoader(
+                root=cfg.data_root,
+                downscale=int(getattr(cfg, "downscale", 1)),
+                white_bkgd=bool(getattr(cfg, "white_bkgd", True)),
+                scene_scale=float(getattr(cfg, "scene_scale", 1.0)),
+                center_origin=bool(getattr(cfg, "center_origin", False)),
+                composite_on_load=bool(getattr(cfg, "composite_on_load", True)),
+                holdout_every=int(getattr(cfg, "llff_holdout_every", 8)),
+                holdout_offset=int(getattr(cfg, "llff_holdout_offset", 0)),
+                angle_sorted_holdout=bool(getattr(cfg, "llff_angle_sorted_holdout", False)),
+                use_llff_recenter=bool(getattr(cfg, "llff_recenter", False)),
+            )
+        else:
+            # Blender (existing behavior)
+            self.loader = BlenderSceneLoader(
+                root=cfg.data_root,
+                downscale=int(getattr(cfg, "downscale", 1)),
+                white_bkgd=bool(getattr(cfg, "white_bkgd", True)),
+                scene_scale=float(getattr(cfg, "scene_scale", 1.0)),
+                center_origin=bool(getattr(cfg, "center_origin", False)),
+                composite_on_load=bool(getattr(cfg, "composite_on_load", True)),
+            )
+
         self.train_scene = self.loader.load(getattr(cfg, "split", "train"))
         try:
             self.val_scene = self.loader.load("val")
@@ -137,10 +162,55 @@ class Trainer:
                 self.val_scene = self.loader.load("test")
             except FileNotFoundError:
                 self.val_scene = self.train_scene
+        self.camera_convention = getattr(self.loader, "camera_convention", "opengl")
 
-        # Near/Far (Blender synthetic commonly ~[2.0, 6.0])
-        self.near = float(getattr(cfg, "near", 2.0))
-        self.far  = float(getattr(cfg, "far",  6.0))
+
+        # ---- Near/Far scene definitions ----
+        if is_llff:
+            # If user didn’t pass explicit near/far, infer them from LLFF bounds
+            user_near = getattr(cfg, "near", None)
+            user_far  = getattr(cfg, "far",  None)
+            if user_near is None or user_far is None:
+                try:
+                    n, f = self.loader.get_global_near_far(
+                        percentile=(float(getattr(cfg, "llff_near_percentile", 5.0)),
+                                    float(getattr(cfg, "llff_far_percentile", 95.0)))
+                    )
+                    self.near, self.far = float(n), float(f)
+                except Exception:
+                    # Robust fallbacks
+                    self.near = float(user_near if user_near is not None else 0.1)
+                    self.far  = float(user_far  if user_far  is not None else 5.0)
+            else:
+                self.near = float(user_near)
+                self.far  = float(user_far)
+        else:
+            # Blender synthetic commonly ~[2.0, 6.0]
+            self.near = float(getattr(cfg, "near", 2.0))
+            self.far  = float(getattr(cfg, "far",  6.0))
+
+        # ---- NDC & sampling range ----
+        # Turn on with --as_ndc (default False). For LLFF forward-facing you may set it True.
+        self.use_ndc: bool = bool(getattr(cfg, "use_ndc", False))
+
+
+        # World-space plane used by the NDC transform inside get_camera_rays
+        # (defaults to the scene near you just computed)
+        _ndc_plane = getattr(cfg, "ndc_near_plane", None)
+        self.ndc_near_plane_world = float(_ndc_plane) if _ndc_plane is not None else float(self.near)
+
+        # FIXME
+        self._debug_check_center_ray(self.train_scene,
+                        self.camera_convention,
+                        as_ndc=False,
+                        near_plane_world=self.ndc_near_plane_world)
+        # Sampling range for z-values used by the renderer/integrator:
+        # - in world space: [near, far]
+        # - in NDC: [0, 1]
+        if self.use_ndc:
+            self.samp_near, self.samp_far = 0.0, 1.0
+        else:
+            self.samp_near, self.samp_far = float(self.near), float(self.far)
 
         # ---- Sampler ----
         if self.vanilla:
@@ -153,6 +223,9 @@ class Trainer:
                 sample_from_single_frame=True,
                 precrop_iters=int(getattr(cfg, "precrop_iters", 500)),
                 precrop_frac=float(getattr(cfg, "precrop_frac", 0.5)),
+                convention=self.camera_convention,
+                as_ndc=self.use_ndc,
+                near_plane=self.ndc_near_plane_world
             )
         else:
             # Mixed-frames batches (default)
@@ -164,6 +237,9 @@ class Trainer:
                 sample_from_single_frame=bool(getattr(cfg, "sample_from_single_frame", False)),
                 precrop_iters=int(getattr(cfg, "precrop_iters", 0)),
                 precrop_frac=float(getattr(cfg, "precrop_frac", 0.5)),
+                convention=self.camera_convention,
+                as_ndc=self.use_ndc,
+                near_plane=self.ndc_near_plane_world
             )
 
         # ---- Encoders ----
@@ -298,6 +374,9 @@ class Trainer:
         self._val_avg_seconds = 0.0                  # running average
 
         print(f"[DEBUG] Trainer: white_bkgd={bool(getattr(cfg,'white_bkgd',True))}  vanilla={self.vanilla}")
+        print(f"[DEBUG] rays: convention={self.camera_convention} use_ndc={self.use_ndc} "
+                f"near={self.near:.4g} far={self.far:.4g} ndc_near_plane={self.ndc_near_plane_world:.4g} "
+                f"samp_range={[self.samp_near, self.samp_far]}")
 
         # ---- Validation Renderer helper ----
 
@@ -344,6 +423,26 @@ class Trainer:
             fps=int(getattr(self.cfg, "path_fps", 24)),
             world_up=None,
         )
+
+    # FIXME remove this
+    def _debug_check_center_ray(self, scene, convention: str, as_ndc: bool, near_plane_world: float, device="cpu"):
+        import torch, numpy as np
+        from nerf_sandbox.source.utils.ray_utils import get_camera_rays
+
+        fr = scene.frames[0]
+        H, W, K, c2w = fr.image.shape[0], fr.image.shape[1], fr.K, fr.c2w
+        rays_o, rays_d = get_camera_rays(
+            image_h=H, image_w=W, intrinsic_matrix=K, transform_camera_to_world=c2w,
+            device=device, dtype=torch.float32, normalize_dirs=True,
+            as_ndc=as_ndc, near_plane=near_plane_world, convention=convention
+        )
+        cx, cy = int(K[0,2]), int(K[1,2])
+        d = rays_d[cy*W + cx].cpu().numpy()
+        R = c2w[:3,:3]
+        # Expected forward in world, by convention:
+        fwd_world = (R[:,2] if convention in ("colmap","opencv") else -R[:,2])
+        ang = np.degrees(np.arccos(np.clip(np.dot(d, fwd_world) / (np.linalg.norm(d)+1e-9), -1, 1)))
+        print(f"[ray sanity] convention={convention} as_ndc={as_ndc} angle(center, fwd) = {ang:.3f}°")
 
     # ---------------- TensorBoard ----------------
     def maybe_init_tensorboard(self):
@@ -420,7 +519,10 @@ class Trainer:
         rgb_srgb = linear_to_srgb(val["rgb"])
         acc_img = val["acc"].squeeze(-1).clamp(0, 1)
         depth_lin = val["depth"]
-        depth_norm = ((depth_lin - self.near) / (self.far - self.near + 1e-8)).squeeze(-1).clamp(0, 1)
+        if self.use_ndc:
+            depth_norm = depth_lin.squeeze(-1).clamp(0, 1)
+        else:
+            depth_norm = ((depth_lin - self.near) / (self.far - self.near + 1e-8)).squeeze(-1).clamp(0, 1)
         save_rgb_png(rgb_srgb, rgb_path)
         save_gray_png(acc_img, acc_path)
         save_gray_png(depth_norm, depth_path)
@@ -653,7 +755,7 @@ class Trainer:
         with torch.amp.autocast(self.device.type, enabled=self.amp):
             # Coarse stratified samples
             t = torch.linspace(0., 1., steps=self.nc, device=self.device, dtype=dtype)
-            zc = self.near * (1. - t) + self.far * t
+            zc = self.samp_near * (1. - t) + self.samp_far * t
             zc = zc.expand(B, self.nc).contiguous()
             # Training perturbation
             mids = 0.5 * (zc[:, 1:] + zc[:, :-1])
@@ -697,7 +799,7 @@ class Trainer:
 
             with torch.amp.autocast(self.device.type, enabled=self.amp):
                 t = torch.linspace(0., 1., steps=self.nc, device=self.device, dtype=dtype)
-                zc = self.near * (1. - t) + self.far * t
+                zc = self.samp_near * (1. - t) + self.samp_far * t
                 zc = zc.expand(Bi, self.nc).contiguous()
                 mids = 0.5 * (zc[:, 1:] + zc[:, :-1])
                 lower = torch.cat([zc[:, :1], mids], dim=-1)
@@ -764,6 +866,7 @@ class Trainer:
         else:
             sigma = F.softplus(sigma_raw_use, beta=1.0).reshape(B, N)
 
+        # rn = None if self.use_ndc else rays_d.norm(dim=-1, keepdim=True)
         rn = rays_d.norm(dim=-1, keepdim=True)
         comp_rgb, weights, acc, depth = volume_render_rays(
             rgb=rgb, sigma=sigma, z_depths=z, ray_norm=rn, white_bkgd=bool(getattr(self.cfg, "white_bkgd", True))

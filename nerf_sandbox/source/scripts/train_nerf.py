@@ -54,8 +54,8 @@ def make_cfg_from_args(args: argparse.Namespace) -> SimpleNamespace:
             cfg.resume_path = args.resume
 
     # Ensure eval defaults follow train unless explicitly set
-    cfg.eval_nc = args.eval_nc
-    cfg.eval_nf = args.eval_nf
+    cfg.nc_eval = args.nc_eval
+    cfg.nf_eval = args.nf_eval
     cfg.eval_chunk = int(args.eval_chunk)
     cfg.val_res_scale = float(args.val_res_scale)
 
@@ -70,12 +70,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data_root", type=str, required=True)
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--downscale", type=int, default=1)
-    ap.add_argument("--white_bkgd", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
+    ap.add_argument("--white_bkgd", type=lambda x: str(x).lower() in ("1","true","yes"), default=False)
     ap.add_argument("--scene_scale", type=float, default=1.0)
     ap.add_argument("--center_origin", action="store_true")
-    ap.add_argument("--composite_on_load", type=lambda x: str(x).lower() in ("1","true","yes"), default=True)
-    ap.add_argument("--near", type=float, default=2.0)
-    ap.add_argument("--far", type=float, default=6.0)
+    ap.add_argument("--composite_on_load", type=lambda x: str(x).lower() in ("1","true","yes"), default=False)
+
+    ap.add_argument("--data_kind", type=str, default="auto",
+                    choices=["auto","blender","llff"])
+
+    # Projection / ray parameterization
+    ap.add_argument("--use_ndc", action="store_true",
+                    help="Use NDC rays (recommended for forward-facing LLFF).")
+    ap.add_argument("--ndc_near_plane", type=float, default=None,
+                    help="World-space near plane used for the NDC warp. "
+                        "If omitted, trainer uses the scene near.")
+
+    # Let LLFF provide near/far unless explicitly set
+    ap.add_argument("--near", type=float, default=None)
+    ap.add_argument("--far",  type=float, default=None)
+
+    # LLFF-specific
+    ap.add_argument("--llff_holdout_every", type=int, default=8)
+    ap.add_argument("--llff_holdout_offset", type=int, default=0)
+    ap.add_argument("--llff_angle_sorted_holdout", action="store_true")
+    ap.add_argument("--llff_recenter", action="store_true",
+                    help="Enable classic LLFF average-pose recentering.")
+    ap.add_argument("--llff_near_percentile", type=float, default=5.0)
+    ap.add_argument("--llff_far_percentile",  type=float, default=95.0)
 
     # Output / Runtime
     ap.add_argument("--out_dir", type=str, default="./exp")
@@ -164,8 +185,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # --- Eval/validation memory controls ---
     ap.add_argument("--eval_chunk", type=int, default=2048, help="Rays per eval chunk.")
-    ap.add_argument("--eval_nc", type=int, default=None, help="Eval coarse samples per ray (default nc).")
-    ap.add_argument("--eval_nf", type=int, default=None, help="Eval fine samples per ray (default nf).")
+    ap.add_argument("--nc_eval", type=int, default=None, help="Eval coarse samples per ray (default nc).")
+    ap.add_argument("--nf_eval", type=int, default=None, help="Eval fine samples per ray (default nf).")
     ap.add_argument("--val_res_scale", type=float, default=1.0, help="Scale validation resolution to save VRAM.")
 
     # One-switch: vanilla bmild parity
@@ -230,7 +251,7 @@ def main():
                 yaw_range_deg=float(cfg.path_yaw_deg),
                 res_scale=float(cfg.path_res_scale),
                 world_up=None,            # auto-detect from validation scene
-                convention="opengl",      # must match get_camera_rays
+                convention=trainer.camera_convention,      # must match get_camera_rays
                 out_subdir="final_path",
                 basename="camera_path",
             )

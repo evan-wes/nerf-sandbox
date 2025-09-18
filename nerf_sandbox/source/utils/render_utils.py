@@ -221,7 +221,8 @@ def _forward_nerf_once(rays_o: torch.Tensor, rays_d: torch.Tensor, z: torch.Tens
                        white_bkgd: bool,
                        sigma_activation: str = "relu",
                        raw_noise_std: float = 0.0,
-                       training: bool = False):
+                       training: bool = False,
+                       use_ray_norm: bool = True):
     """
     Stateless coarse/fine pass over given z samples.
     Returns composite RGB, weights, acc, depth (all batch-shaped).
@@ -245,7 +246,7 @@ def _forward_nerf_once(rays_o: torch.Tensor, rays_d: torch.Tensor, z: torch.Tens
     else:
         sigma = F.softplus(sigma_raw, beta=1.0).reshape(B, N)
 
-    rn = rays_d.norm(dim=-1, keepdim=True)
+    rn = rays_d.norm(dim=-1, keepdim=True) if use_ray_norm else None
     return volume_render_rays(rgb, sigma, z, rn, white_bkgd=white_bkgd)
 
 
@@ -318,6 +319,12 @@ def render_image_chunked(rays_o: torch.Tensor, rays_d: torch.Tensor,
     t_lin = torch.linspace(0.0, 1.0, steps=nc_eval, device=device, dtype=render_dtype)
     z_coarse_template = near * (1.0 - t_lin) + far * t_lin  # (nc_eval,)
 
+    # # AUTO: if we’re sampling in NDC ([0,1]), don’t scale bins by ‖dir‖
+    # ndc_sampling = (abs(float(near)) <= 1e-8) and (abs(float(far) - 1.0) <= 1e-8)
+    # use_ray_norm = not ndc_sampling
+
+    use_ray_norm = True
+
     # Whether to add training-style noise to sigma during eval
     use_density_noise = float(raw_noise_std) > 0.0
 
@@ -358,6 +365,7 @@ def render_image_chunked(rays_o: torch.Tensor, rays_d: torch.Tensor,
                 sigma_activation=sigma_activation,
                 raw_noise_std=raw_noise_std,
                 training=use_density_noise,  # enable noise path if requested
+                use_ray_norm=use_ray_norm
             )
 
         # ----- Hierarchical resampling for fine pass -----
@@ -385,6 +393,7 @@ def render_image_chunked(rays_o: torch.Tensor, rays_d: torch.Tensor,
                 sigma_activation=sigma_activation,
                 raw_noise_std=raw_noise_std,
                 training=use_density_noise,  # mirror noise choice for fine pass
+                use_ray_norm=use_ray_norm
             )
 
         # Ensure fine outputs have shape (batch, 1) for assignment into preallocated (B,1) buffers.
@@ -407,27 +416,48 @@ def render_image_chunked(rays_o: torch.Tensor, rays_d: torch.Tensor,
 
 
 @torch.no_grad()
-def render_pose(c2w: np.ndarray | torch.Tensor, H: int, W: int, K: np.ndarray | torch.Tensor,
-                near: float, far: float,
-                pos_enc, dir_enc,
-                nerf_c, nerf_f,
-                device: torch.device,
-                white_bkgd: bool = True,
-                eval_nc: int = 64, eval_nf: int = 128,
-                eval_chunk: int = 8192,
-                perturb: bool = False,
-                raw_noise_std: float = 0.0,
-                sigma_activation: str = "relu") -> torch.Tensor:
+def render_pose(
+    c2w, H, W, K,
+    near: float, far: float,             # keep for backward-compat (world-space)
+    pos_enc, dir_enc, nerf_c, nerf_f,
+    device,
+    white_bkgd=True, nc_eval=64, nf_eval=128, eval_chunk=8192,
+    perturb=False, raw_noise_std=0.0, sigma_activation="relu",
+    *,
+    use_ndc: bool = False,
+    convention: str = "opengl",
+    near_plane: float | None = None,     # NEW: world-space plane for NDC warp
+    samp_near: float | None = None,      # NEW: sampling start override
+    samp_far: float | None = None        # NEW: sampling end override
+):
+    # 1) Choose near-plane for ray generation
+    ndc_near = near if near_plane is None else near_plane
+
     rays_o, rays_d = get_camera_rays(
         image_h=H, image_w=W, intrinsic_matrix=K, transform_camera_to_world=c2w,
-        device=device, dtype=torch.float32, normalize_dirs=True, as_ndc=False, near_plane=near
+        device=device, dtype=torch.float32, normalize_dirs=True,
+        as_ndc=use_ndc, near_plane=ndc_near, convention=convention
     )
+
+    # 2) Choose sampling bounds for the integrator
+    if use_ndc:
+        s_near = 0.0 if samp_near is None else samp_near
+        s_far  = 1.0 if samp_far  is None else samp_far
+    else:
+        s_near = near if samp_near is None else samp_near
+        s_far  = far  if samp_far  is None else samp_far
+
     out = render_image_chunked(
-        rays_o, rays_d, H, W, near, far, pos_enc, dir_enc, nerf_c, nerf_f,
-        eval_nc, eval_nf, white_bkgd, device, eval_chunk, perturb, raw_noise_std, sigma_activation
+        rays_o, rays_d, H, W,
+        near=s_near, far=s_far,
+        pos_enc=pos_enc, dir_enc=dir_enc,
+        nerf_c=nerf_c, nerf_f=nerf_f,
+        nc_eval=nc_eval, nf_eval=nf_eval,
+        white_bkgd=white_bkgd, device=device,
+        eval_chunk=eval_chunk, perturb=perturb,
+        raw_noise_std=raw_noise_std, sigma_activation=sigma_activation
     )
     return out["rgb"]
-
 
 # ------------------------- Camera path rendering -------------------------
 
