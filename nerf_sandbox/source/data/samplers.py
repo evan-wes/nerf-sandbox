@@ -10,15 +10,9 @@ import random
 from typing import Iterator, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 from nerf_sandbox.source.utils.render_utils import get_camera_rays
-
-
-# Minimal protocol Scene/Frame:
-# scene.frames[i].image: np.ndarray (H,W,3 or 4) in [0,1]
-# scene.frames[i].K: (3,3) float
-# scene.frames[i].c2w: (4,4) float
-# scene.white_bkgd: bool
 
 
 class RaySampler:
@@ -88,122 +82,210 @@ class RandomPixelRaySampler(RaySampler):
         self.B = int(rays_per_batch)
         self.device = torch.device(device) if device is not None else None
         self.white_bkgd = scene.white_bkgd if white_bg_composite is None else bool(white_bg_composite)
-        self.cache = bool(cache_images_on_device)
         self.convention = convention
         self.as_ndc = as_ndc
         self.near_plane = near_plane
 
-        # Sampling behavior toggles
         self.sample_from_single_frame = bool(sample_from_single_frame)
         self.precrop_iters = int(precrop_iters)
         self.precrop_frac = float(precrop_frac)
-        self._global_step = 0  # incremented per yielded batch
+        self._global_step = 0
 
-        # Cache per-frame tensors (images, intrinsics, extrinsics)
-        self._Ks = []
-        self._c2ws = []
-        self._imgs = []
+        # --- Where should images live? ---
+        on_cuda = (self.device is not None and self.device.type == "cuda")
+        self.cache = bool(cache_images_on_device) and on_cuda
+        img_device = (self.device if self.cache else torch.device("cpu"))
+        self._imgs_on_gpu = (img_device.type != "cpu")  # used in __iter__
+
+        # Cache frame tensors
+        self._Ks, self._c2ws, self._imgs = [], [], []
         for f in self.scene.frames:
-            self._Ks.append(torch.as_tensor(f.K, dtype=torch.float32, device=self.device))
+            # tiny → keep with model device
+            self._Ks.append(torch.as_tensor(f.K,   dtype=torch.float32, device=self.device))
             self._c2ws.append(torch.as_tensor(f.c2w, dtype=torch.float32, device=self.device))
-            img = torch.as_tensor(f.image, dtype=torch.float32, device=self.device)
-            self._imgs.append(img)
 
-        # Assume consistent resolution across frames
-        self.H = self.scene.frames[0].image.shape[0]
-        self.W = self.scene.frames[0].image.shape[1]
+            # big → follow the cache policy (GPU or CPU pinned)
+            img_t = torch.as_tensor(f.image, dtype=torch.float32, device=img_device)
+            if img_t.device.type == "cpu":
+                try:
+                    img_t = img_t.pin_memory()
+                except Exception:
+                    pass
+            self._imgs.append(img_t)
+
+        self.H = int(self.scene.frames[0].image.shape[0])
+        self.W = int(self.scene.frames[0].image.shape[1])
 
     def _current_crop_bounds(self) -> tuple[int, int, int, int]:
-        """
-        Compute (h0, h1, w0, w1) for the current iteration based on precropping.
-        Full-frame if precrop_iters exhausted or disabled.
-        """
         H, W = self.H, self.W
         if self._global_step < self.precrop_iters and 0.0 < self.precrop_frac < 1.0:
             f = self.precrop_frac
-            h0 = int(H * 0.5 * (1.0 - f))
-            h1 = int(H * 0.5 * (1.0 + f))
-            w0 = int(W * 0.5 * (1.0 - f))
-            w1 = int(W * 0.5 * (1.0 + f))
+            h0 = int(H * 0.5 * (1.0 - f)); h1 = int(H * 0.5 * (1.0 + f))
+            w0 = int(W * 0.5 * (1.0 - f)); w1 = int(W * 0.5 * (1.0 + f))
         else:
             h0, h1, w0, w1 = 0, H, 0, W
         return h0, h1, w0, w1
 
     def _composite_rgb(self, pix: torch.Tensor) -> torch.Tensor:
-        """
-        Composite RGBA onto white if requested; otherwise return RGB as-is.
-        pix: (..., C) where C is 3 or 4.
-        """
         if self.white_bkgd and pix.shape[-1] == 4:
             return pix[..., :3] * pix[..., 3:4] + (1.0 - pix[..., 3:4])
         return pix[..., :3]
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """
+        Device-safe iterator:
+        • Index pixels on the image's device (CPU if not cached, GPU if cached)
+        • Move gathered RGB (and xy) to self.device
+        • Build rays on self.device with get_camera_rays
+        """
         num_frames = len(self._imgs)
 
         while True:
             h0, h1, w0, w1 = self._current_crop_bounds()
 
             if self.sample_from_single_frame:
-                # -------- Single-frame mode (vanilla NeRF) --------
-                frame_id = random.randrange(num_frames)
-                K = self._Ks[frame_id]
-                c2w = self._c2ws[frame_id]
-                img = self._imgs[frame_id]
+                # ---------- Single-frame mode ----------
+                fid = random.randrange(num_frames)
 
-                # Sample pixel coordinates within the (possibly cropped) region
-                ys = torch.randint(h0, h1, (self.B,), device=self.device)
-                xs = torch.randint(w0, w1, (self.B,), device=self.device)
+                # Per-frame tensors
+                K   = self._Ks[fid]    # expected on self.device
+                c2w = self._c2ws[fid]  # expected on self.device
+                img = self._imgs[fid]  # may be CPU (not cached) or GPU (cached)
+                src_dev = img.device
 
-                # Build rays for this frame
+                # Sample indices on the *image's* device and gather pixels there
+                ys_src = torch.randint(h0, h1, (self.B,), device=src_dev)
+                xs_src = torch.randint(w0, w1, (self.B,), device=src_dev)
+                pix    = img[ys_src.long(), xs_src.long()]  # (B, 3 or 4) on src_dev
+
+                # Normalize to [0,1] if needed, composite RGBA→RGB if needed
+                if pix.dtype.is_floating_point and float(pix.max().detach().cpu()) > 1.5:
+                    pix = pix / 255.0
+                rgb = self._composite_rgb(pix)  # stays on src_dev
+
+                # Move gathered data to working device for ray generation / training
+                if rgb.device != self.device:
+                    rgb = rgb.to(self.device, non_blocking=True)
+                xs = xs_src.to(self.device, non_blocking=True)
+                ys = ys_src.to(self.device, non_blocking=True)
                 pixels_xy = torch.stack([xs.to(torch.float32), ys.to(torch.float32)], dim=-1)
-                rays_o, rays_d = get_camera_rays(self.H, self.W, K, c2w,
-                                                 device=self.device, pixels_xy=pixels_xy,
-                                                 convention=self.convention,
-                                                 as_ndc=self.as_ndc, near_plane=self.near_plane)
 
-                # Gather RGB targets (composite if RGBA and white_bkgd)
-                pix = img[ys.long(), xs.long()]
-                rgb = self._composite_rgb(pix)
+                # Rays on self.device
+                (
+                    rays_o_world,
+                    rays_d_world_unit,
+                    rays_d_world_norm,
+                    rays_o_marching,
+                    rays_d_marching_unit,
+                    rays_d_marching_norm,
+                ) = get_camera_rays(
+                    self.H, self.W, K, c2w,
+                    device=self.device, dtype=torch.float32,
+                    convention=self.convention,
+                    pixel_center=True,
+                    as_ndc=self.as_ndc, near_plane=self.near_plane,
+                    pixels_xy=pixels_xy,
+                )
 
-                batch = {"rays_o": rays_o, "rays_d": rays_d, "rgb": rgb}
-
-            else:
-                # -------- Mixed-frames mode (uniform across all frames) --------
-                # Sample coordinates & frame indices independently
-                ys = torch.randint(h0, h1, (self.B,), device=self.device)
-                xs = torch.randint(w0, w1, (self.B,), device=self.device)
-                frame_ids = torch.randint(0, num_frames, (self.B,), device=self.device)
-
-                rays_o_list = []
-                rays_d_list = []
-                rgb_list = []
-
-                # Build rays per unique frame to avoid recomputing K/c2w per pixel
-                for fid in frame_ids.unique().tolist():
-                    mask = (frame_ids == fid)
-                    K = self._Ks[fid]
-                    c2w = self._c2ws[fid]
-                    img = self._imgs[fid]
-
-                    px = torch.stack([xs[mask].to(torch.float32), ys[mask].to(torch.float32)], dim=-1)
-                    ro, rd = get_camera_rays(self.H, self.W, K, c2w,
-                                             device=self.device, pixels_xy=px,
-                                             convention=self.convention,
-                                             as_ndc=self.as_ndc, near_plane=self.near_plane)
-
-                    pix = img[ys[mask].long(), xs[mask].long()]
-                    rgb = self._composite_rgb(pix)
-
-                    rays_o_list.append(ro)
-                    rays_d_list.append(rd)
-                    rgb_list.append(rgb)
+                # if self.as_ndc:
+                #     assert torch.allclose(rays_d_marching_norm, torch.ones_like(rays_d_marching_norm))
 
                 batch = {
-                    "rays_o": torch.cat(rays_o_list, dim=0),
-                    "rays_d": torch.cat(rays_d_list, dim=0),
-                    "rgb":   torch.cat(rgb_list,   dim=0),
+                    "rgb":                  rgb,
+                    "rays_o_world":         rays_o_world,
+                    "rays_d_world_unit":    rays_d_world_unit,
+                    "rays_d_world_norm":    rays_d_world_norm,
+                    "rays_o_marching":      rays_o_marching,
+                    "rays_d_marching_unit": rays_d_marching_unit,
+                    "rays_d_marching_norm": rays_d_marching_norm,
                 }
+
+            else:
+                # ---------- Mixed-frames mode ----------
+                # Sample once (CPU is fine), then fan out per-fid
+                ys_all   = torch.randint(h0, h1, (self.B,), device="cpu")
+                xs_all   = torch.randint(w0, w1, (self.B,), device="cpu")
+                fids_all = torch.randint(0, num_frames, (self.B,), device="cpu")
+                uniq_fids = torch.unique(fids_all).tolist()
+
+                rgb_list = []
+                rays_o_world_list, rays_d_world_unit_list, rays_d_world_norm_list = [], [], []
+                rays_o_marching_list, rays_d_marching_unit_list, rays_d_marching_norm_list = [], [], []
+
+                for fid in uniq_fids:
+                    mask = (fids_all == fid)
+                    if not bool(mask.any()):
+                        continue
+
+                    # Slice indices for this frame
+                    xs_f_cpu = xs_all[mask]
+                    ys_f_cpu = ys_all[mask]
+
+                    # Per-frame tensors
+                    K   = self._Ks[fid]    # on self.device
+                    c2w = self._c2ws[fid]  # on self.device
+                    img = self._imgs[fid]  # CPU or GPU
+                    src_dev = img.device
+
+                    # Index on the image's device
+                    xs_src = xs_f_cpu.to(src_dev, non_blocking=True)
+                    ys_src = ys_f_cpu.to(src_dev, non_blocking=True)
+                    pix    = img[ys_src.long(), xs_src.long()]  # (Bi, 3 or 4) on src_dev
+
+                    if pix.dtype.is_floating_point and float(pix.max().detach().cpu()) > 1.5:
+                        pix = pix / 255.0
+                    rgb = self._composite_rgb(pix)  # on src_dev
+                    if rgb.device != self.device:
+                        rgb = rgb.to(self.device, non_blocking=True)
+                    rgb_list.append(rgb)
+
+                    # Build rays for these pixels on self.device
+                    px = torch.stack([
+                        xs_f_cpu.to(self.device, non_blocking=True, dtype=torch.float32),
+                        ys_f_cpu.to(self.device, non_blocking=True, dtype=torch.float32)
+                    ], dim=-1)
+
+                    (
+                        rays_o_world,
+                        rays_d_world_unit,
+                        rays_d_world_norm,
+                        rays_o_marching,
+                        rays_d_marching_unit,
+                        rays_d_marching_norm,
+                    ) = get_camera_rays(
+                        self.H, self.W, K, c2w,
+                        device=self.device, dtype=torch.float32,
+                        convention=self.convention,
+                        pixel_center=True,
+                        as_ndc=self.as_ndc, near_plane=self.near_plane,
+                        pixels_xy=px,
+                    )
+
+                    # if self.as_ndc:
+                    #     assert torch.allclose(rays_d_marching_norm, torch.ones_like(rays_d_marching_norm))
+
+                    rays_o_world_list.append(rays_o_world)
+                    rays_d_world_unit_list.append(rays_d_world_unit)
+                    rays_d_world_norm_list.append(rays_d_world_norm)
+                    rays_o_marching_list.append(rays_o_marching)
+                    rays_d_marching_unit_list.append(rays_d_marching_unit)
+                    rays_d_marching_norm_list.append(rays_d_marching_norm)
+
+                batch = {
+                    "rgb":                  torch.cat(rgb_list, dim=0),
+                    "rays_o_world":         torch.cat(rays_o_world_list,   dim=0),
+                    "rays_d_world_unit":    torch.cat(rays_d_world_unit_list,  dim=0),
+                    "rays_d_world_norm":    torch.cat(rays_d_world_norm_list,  dim=0),
+                    "rays_o_marching":      torch.cat(rays_o_marching_list,   dim=0),
+                    "rays_d_marching_unit": torch.cat(rays_d_marching_unit_list,  dim=0),
+                    "rays_d_marching_norm": torch.cat(rays_d_marching_norm_list,  dim=0),
+                }
+
+            # Sanity: marching norms finite/positive (NDC => ~1; non-NDC => you set to 1s)
+            if (self._global_step % 200) == 0:
+                rn = batch["rays_d_marching_norm"]
+                assert torch.isfinite(rn).all() and (rn > 0).all(), "Invalid rays_d_marching_norm!"
 
             self._global_step += 1
             yield batch
+

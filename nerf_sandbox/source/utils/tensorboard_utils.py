@@ -21,7 +21,6 @@ try:
 except Exception:  # pragma: no cover
     SummaryWriter = None  # type: ignore
 
-from nerf_sandbox.source.utils.render_utils import linear_to_srgb
 
 
 class TensorBoardLogger:
@@ -128,7 +127,6 @@ class TensorBoardLogger:
         step: int,
         near: float,
         far: float,
-        convert_to_srgb: bool = True,
         image_max_side: Optional[int] = None,
     ) -> None:
         if not self._ensure_writer():
@@ -138,8 +136,6 @@ class TensorBoardLogger:
             self.image_max_side = int(image_max_side)
 
         rgb = val["rgb"]  # (H,W,3) linear [0,1]
-        if convert_to_srgb:
-            rgb = linear_to_srgb(rgb)
         acc = val["acc"].squeeze(-1)          # (H,W)
         depth = val["depth"].squeeze(-1)      # (H,W)
         depth_norm = (depth - near) / (max(1e-8, (far - near)))
