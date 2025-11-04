@@ -1,4 +1,4 @@
-"""Contains utilities for encoding data"""
+"""Contains the PositionalEncoder class for encoding data"""
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ class PositionalEncoder(nn.Module):
         log_spaced: bool = True,
         min_freq_log2: int | None = None,
         max_freq_log2: int | None = None,
-        use_two_pi: bool = False
+        use_two_pi: bool = False,
     ) -> None:
         """
         Initialization for the PositionalEncoder class.
@@ -46,25 +46,27 @@ class PositionalEncoder(nn.Module):
         None
         """
         super().__init__()
-        self.input_dims = input_dims
-        self.num_freqs = num_freqs
-        self.include_input = include_input
-        self.use_two_pi = use_two_pi
+        self.input_dims = int(input_dims)
+        self.num_freqs = int(num_freqs)
+        self.include_input = bool(include_input)
+        self.use_two_pi = bool(use_two_pi)
 
         if min_freq_log2 is None:
             min_freq_log2 = 0
         if max_freq_log2 is None:
-            max_freq_log2 = num_freqs - 1
+            max_freq_log2 = self.num_freqs - 1
 
         if log_spaced:
-            # Logarithmically spaced [2^0, 2^1, ..., 2^max_freq_log2]
-            freq_bands = 2.0 ** torch.linspace(float(min_freq_log2), float(max_freq_log2), steps=num_freqs)
+            # 2^{min..max}, num_freqs samples
+            freq_bands = 2.0 ** torch.linspace(float(min_freq_log2), float(max_freq_log2), steps=self.num_freqs)
         else:
-            # Linearly spaced between 2^0 and 2^max_freq_log2
-            freq_bands = torch.linspace(2.0**float(min_freq_log2), 2.0**float(max_freq_log2), steps=num_freqs)
+            # Linear in frequency but same endpoints
+            freq_bands = torch.linspace(2.0 ** float(min_freq_log2),
+                                        2.0 ** float(max_freq_log2),
+                                        steps=self.num_freqs)
 
-        # Register as buffer so it follows the module's device/dtype
-        self.register_buffer('freq_bands', freq_bands, persistent=False)
+        # Register as a buffer so .to(device) on the module moves it
+        self.register_buffer("freq_bands", freq_bands, persistent=False)
 
         self.out_dim = (self.input_dims if self.include_input else 0) + self.input_dims * self.num_freqs * 2
 
@@ -75,30 +77,33 @@ class PositionalEncoder(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of shape (num_rays, D), where D = input_dims provided to the class init
+            Input tensor of shape (..., D), where D = input_dims provided to the class init
 
         Returns
         -------
         torch.Tensor
-            Encoded tensor of shape (num_rays, self.out_dim)
+            Encoded tensor of shape (..., self.out_dim)
         """
+        # Ensure buffer uses the same device & dtype as x
+        fb = self.freq_bands.to(device=x.device, dtype=x.dtype)
 
-        # [num_rays, None, D] * [F] -> [num_rays, F, D]
-        scale = (2 * torch.pi) if self.use_two_pi else torch.tensor(1.0, device=x.device, dtype=x.dtype)
-        xb = x.unsqueeze(-2) * (self.freq_bands.to(dtype=x.dtype) * scale).unsqueeze(-1)  # broadcast
+        # Make scale a tensor on x's device/dtype (avoid CPU scalar with CUDA tensor)
+        scale_val = 2 * torch.pi if self.use_two_pi else 1.0
+        scale = torch.as_tensor(scale_val, device=x.device, dtype=x.dtype)
 
-        # [num_rays, F, D] -> [num_rays, F, D] each
-        sin_feats = torch.sin(xb)
-        cos_feats = torch.cos(xb)
+        # (..., 1, D) * (F, 1) -> (..., F, D)
+        xb = x.unsqueeze(-2) * (fb * scale).unsqueeze(-1)
 
-        # Flatten freq and dim: [num_rays, F*D]
+        sin_feats = torch.sin(xb)   # (..., F, D)
+        cos_feats = torch.cos(xb)   # (..., F, D)
+
+        # concat along freq axis, then flatten freq & dim: (..., 2F*D)
         enc = torch.cat([sin_feats, cos_feats], dim=-2).reshape(*x.shape[:-1], -1)
 
         if self.include_input:
             enc = torch.cat([x, enc], dim=-1)
 
         return enc
-
 
 def get_vanilla_nerf_encoders():
     """

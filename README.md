@@ -14,8 +14,9 @@ As the intent of this project is to learn more about neural radiance fields and 
 - Camera path rendering for novel scene generation, both during training and after
 - Rendering of RGB, depth, and opacity as the model learns the scene
 - Comprehensive validation scheduling to generate *training progress videos* that can be linear or power-based to generate more frames at earlier stages.
-  - An example training progress video made from this code can be found here on [YouTube](https://youtu.be/EJCblYlA6Tk?si=7lgSbz1_i9fpVDWA)
+  - An example for the Lego and Fern datasets are shown in this Gif:
 
+![Demo](assets/training_progress_demo.gif)
 
 ## Features
 
@@ -36,10 +37,6 @@ As the intent of this project is to learn more about neural radiance fields and 
 - **TensorBoard logging**
   - Scalars + images (RGB/opacity/depth). Works across resumes (same log dir).
 
-Below is an example of the training progress video generation using a power-law validation schedule to render more frames along the path at earlier training iterations. The main purpose is to illustrate how the implicit representation of the scene rapidly evolves as the structure is learned.
-
-![Demo](assets/training_progress_demo.gif)
-
 ---
 
 ## Quick start
@@ -54,22 +51,34 @@ Use the Blender synthetic dataset (e.g., **lego**). Point `--data_root` to the d
 
 File paths in the JSON are used **as-is**, with “.png” appended.
 
-### 2) Train on LEGO with vanilla settings
+### 2) Train on Lego or Fern with vanilla settings
 
-#### from the repo root
+Lego:
 ```
-$ python nerf_sandbox/source/scripts/train_nerf.py \
+$ python3 nerf_sandbox/source/scripts/train_nerf.py \
+  --data_kind blender \
   --data_root /path/to/nerf_synthetic/lego \
-  --out_dir   /path/to/exp/lego_vanilla \
-  --vanilla \
-  --max_steps 30000 \
-  --ckpt_every 5000 \
+  --out_dir /path/to/lego_vanilla \
+  --vanilla --device cuda:0 --seed 0 \
+  --max_steps 50000 --log_every 100 --ckpt_every 10000 \
   --use_tb \
-  --num_val_steps 50 \
-  --val_schedule power --val_power 2.5 \
-  --val_indices 0,3,11 \
-  --progress_video_during_training --progress_frames 300 \
-  --render_path_after --path_frames 300 --path_type spiral
+  --progress_video_during_training --progress_frames 150 --val_power 3 \
+  --render_path_after
+```
+
+Fern:
+```
+$ python3 nerf_sandbox/source/scripts/train_nerf.py  \
+  --data_kind llff \
+  --data_root /path/to/nerf_llff_data/fern \
+  --out_dir /path/to/fern_vanilla_final \
+  --vanilla --device cuda:0 --seed 0 \
+  --use_ndc --ndc_near_plane_world 1.0 \
+  --downscale 8 \
+  --max_steps 100000 --log_every 100 --ckpt_every 10000 \
+  --use_tb \
+  --progress_video_during_training --progress_frames 180 --val_power 3 \
+  --render_path_after
 ```
 Notes:
 - If you hit OOM during validation, try `--eval_chunk 2048` (or 1024) and/or `--val_res_scale 0.5`.
@@ -99,33 +108,7 @@ python nerf_sandbox/source/scripts/train_nerf.py \
 
 On resume, the **validation schedule** and **progress-video state** are reloaded so the next validation block and progress frames continue exactly where they should.
 
----
-
-## CLI tips
-
-Show all options:
-
-python nerf_sandbox/source/scripts/train_nerf.py --help
-
-Common knobs:
-- `--rays_per_batch`, `--nc`, `--nf`, `--raw_noise_std`, `--sigma_activation`
-- `--eval_chunk`, `--val_res_scale`
-- `--num_val_steps`, `--val_schedule {uniform,power}`, `--val_power`
-- `--val_indices 0,3,11` (skip the default “single view” behavior)
-- `--progress_video_during_training --progress_frames 300`
-- `--render_path_after --path_frames 300 --path_type {circle,spiral}`
-
-
-**What `--vanilla` flips under the hood:**
-
-- Encoders: Lx=10 (pos), Ld=4 (dir); include original inputs.
-- Model: 8×256 with mid-skip; ReLU σ, raw σ noise during training.
-- Sampling: N_rand=1024 from a single image per step, **center precrop** warmup.
-- Background: white; near/far default `[2.0, 6.0]`.
-- Learning rate: `5e-4` (cosine/other schedulers optional).
-
----
-
 ## Acknowledgements
 
 - The "vanilla" mode is based off of the original NeRF paper: https://github.com/bmild/nerf
+- PyTorch details and debugging of LLFF implementation was done with help of https://github.com/yenchenlin/nerf-pytorch with excellent blog post https://yconquesty.github.io/blog/ml/nerf/nerf_rendering.html

@@ -1,180 +1,137 @@
 """Utilities for generating camera rays for rendering scenes"""
 
+from __future__ import annotations
 import numpy as np
 import torch
 
 from nerf_sandbox.source.utils.torch_utils import to_torch
 
+
+@torch.no_grad()
 def get_camera_rays(
     image_h: int,
     image_w: int,
-    intrinsic_matrix: np.ndarray | torch.Tensor,
-    transform_camera_to_world: np.ndarray | torch.Tensor,
+    intrinsic_matrix: np.ndarray | torch.Tensor,      # K: (3,3)
+    transform_camera_to_world: np.ndarray | torch.Tensor,  # c2w: (3,4) or (4,4)
+    *,
     device: str | torch.device | None = None,
-    dtype: np.dtype | torch.dtype = torch.float32,
-    normalize_dirs: bool = True,
+    dtype: torch.dtype = torch.float32,
+    convention: str = "opengl",
+    pixel_center: bool = False,
     as_ndc: bool = False,
     near_plane: float = 1.0,
     pixels_xy: np.ndarray | torch.Tensor | None = None,
-    convention: str = "opengl"
-) -> tuple[torch.Tensor, torch.Tensor]:
+):
     """
-    Constructs camera rays in the world frame for each pixel in an image, or a specific
-    set of pixels. Can return rays with the following coordinate system convention.
+    Returns:
+        rays_o_world, rays_d_world_unit, rays_d_world_norm,
+        rays_o_marching, rays_d_marching_unit, rays_d_marching_norm
 
-    Conventions (camera-space axes):
-      - 'opengl'/'blender'/'nerf': +X right, +Y up, camera looks along -Z
-      - 'opencv'/'colmap'        : +X right, +Y down, camera looks along +Z
-      - 'pytorch3d'/'p3d'        : +X right, +Y up, camera looks along +Z
-
-    Parameters
-    ----------
-    image_h : int
-        Height of the image in pixels
-    image_w : int
-        Width of the image in pixels
-    intrinsic_matrix : np.ndarray | torch.Tensor
-        Camera intrinsic matrix with shape (3, 3).
-    transform_camera_to_world : np.ndarray | torch.Tensor
-        Transformation matrix from the camera's local frame to the world frame.
-        Can be shape (3, 4) or (4, 4) with the first three rows being [R | t].
-    device : str | torch.device, optional
-        The device to move the tensors of generated rays to. Defaults to None.
-    dtype : np.dtype | torch.dtype, optional
-        The data type to use for the generated rays. Default is torch.float32
-    normalize_dirs : bool, optional
-        A flag to convert the ray direction vectors to unit vectors. Default is
-        True.
-    as_ndc : bool, optional
-        A flag to return the rays in Normalized Device Coordinates (NDC). Default
-        is False
-    near_plane : float, optional
-        The near plane distance for the NDC transformation. Default is 1.0
-    pixels_xy : np.ndarray | torch.Tensor, optional
-        A set of image pixels to generate rays for. If not provided, rays are
-        generated for the whole image. Defaults to None
-    convention : str, optional
-        See above. Default 'opengl' (Blender/vanilla NeRF).
-
-    Returns
-    -------
-    ray_origins_world : torch.Tensor
-        Tensor of shape (N, 3) with dtype and device specified by the inputs
-        representing the origins of each ray in the world frame or NDC coordinates.
-        N is equal to the product of the input image width and height if pixels_xy
-        is not provided, otherwise len(pixels_xy).
-    ray_directions_world : torch.Tensor
-        Tensor of shape (N, 3) with dtype and device specified by the inputs
-        representing the directions of each ray in the world frame or NDC coordinates.
-        N is equal to the product of the input image width and height if pixels_xy
-        is not provided, otherwise len(pixels_xy). The vectors are normalized if the
-        input `normalize_dirs` flag is True.
     """
+    dev = torch.device(device) if device is not None else None
+    K   = torch.as_tensor(intrinsic_matrix, device=dev, dtype=dtype)
+    c2w = torch.as_tensor(transform_camera_to_world, device=dev, dtype=dtype)
 
-    # Standardize the input arrays
-    intrinsic_matrix = to_torch(intrinsic_matrix, device=device, dtype=dtype)
-    transform_camera_to_world = to_torch(transform_camera_to_world, device=device, dtype=dtype)
+    if K.shape[-2:] != (3, 3):
+        raise ValueError(f"K must be (3,3), got {K.shape}")
+    if c2w.shape[-2:] not in {(3,4), (4,4)}:
+        raise ValueError(f"c2w must be (3,4) or (4,4), got {c2w.shape}")
 
-    # Validate shapes of intrinsic and transform matrices
-    if intrinsic_matrix.shape[-2:] != (3, 3):
-        raise ValueError(f"Expected intrinsic matrix shape (3, 3), got {intrinsic_matrix.shape}")
+    R = c2w[..., :3, :3]
+    t = c2w[..., :3, 3]
 
-    sh = transform_camera_to_world.shape[-2:]
-    if sh not in {(4, 4), (3, 4)}:
-        raise ValueError(
-            "Expected camera-to-world shape (4, 4) or (3, 4), "
-            f"got {transform_camera_to_world.shape}"
+    # ---- pixel grid ----
+    if pixels_xy is None:
+        ys, xs = torch.meshgrid(
+            torch.arange(image_h, device=dev, dtype=dtype),
+            torch.arange(image_w, device=dev, dtype=dtype),
+            indexing="ij",  # row-major: y first, x second
         )
-
-    # Extract rotation (R) and translation (t) from the input transform matrix
-    rotation = transform_camera_to_world[..., :3, :3]
-    translation = transform_camera_to_world[..., :3, 3]
-
-    # Create a grid of pixel indexing (xy indexing -> i = x, j = y)
-    if pixels_xy is not None:
-        pixels_xy = to_torch(pixels_xy, device=device, dtype=dtype)
-        x_img = pixels_xy[:, 0]
-        y_img = pixels_xy[:, 1]
+        if pixel_center:
+            xs = xs + 0.5
+            ys = ys + 0.5
+        x_img = xs.reshape(-1)  # (H*W,)
+        y_img = ys.reshape(-1)  # (H*W,)
     else:
-        i, j = torch.meshgrid(
-            torch.arange(image_w, device=intrinsic_matrix.device, dtype=intrinsic_matrix.dtype),
-            torch.arange(image_h, device=intrinsic_matrix.device, dtype=intrinsic_matrix.dtype),
-            indexing="xy"
-        )  # each shape [W, H]
-        x_img = i.reshape(-1)  # [N]
-        y_img = j.reshape(-1)  # [N]
+        px = torch.as_tensor(pixels_xy, device=dev, dtype=dtype)  # (N,2) [x,y]
+        if pixel_center:
+            px = px + 0.5
+        x_img = px[..., 0].reshape(-1)
+        y_img = px[..., 1].reshape(-1)
 
-    # Directions in camera frame (pinhole model)
-    # x_cam = (x_img - c_x)/f_x, y_cam = (y_img - c_y)/f_y, z = 1
-    f_x, f_y = intrinsic_matrix[..., 0, 0], intrinsic_matrix[..., 1, 1]
-    c_x, c_y = intrinsic_matrix[..., 0, 2], intrinsic_matrix[..., 1, 2]
+    # ---- intrinsics ----
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
 
-    # Broadcast f_x, f_y, c_x, c_y if they have extra leading dims
-    x_cam = (x_img - c_x) / f_x
-    y_cam = (y_img - c_y) / f_y
+    x_cam = (x_img - cx) / fx
+    y_cam = (y_img - cy) / fy
 
     conv = (convention or "opengl").lower()
     if conv in ("opengl", "blender", "nerf"):
-        # +X right, +Y up, forward -Z  → flip image y, z = -1
-        ray_directions_camera = torch.stack([x_cam, -y_cam, -torch.ones_like(x_cam)], dim=-1)
+        dirs_cam = torch.stack([x_cam, -y_cam, -torch.ones_like(x_cam)], dim=-1)
     elif conv in ("opencv", "colmap"):
-        # +X right, +Y down, forward +Z → no flip, z = +1
-        ray_directions_camera = torch.stack([x_cam,  y_cam,  torch.ones_like(x_cam)], dim=-1)
+        dirs_cam = torch.stack([x_cam,  y_cam,  torch.ones_like(x_cam)],  dim=-1)
     elif conv in ("pytorch3d", "p3d"):
-        # +X right, +Y up, forward +Z → flip image y, z = +1
-        ray_directions_camera = torch.stack([x_cam, -y_cam,  torch.ones_like(x_cam)], dim=-1)
+        dirs_cam = torch.stack([x_cam, -y_cam,  torch.ones_like(x_cam)],  dim=-1)
     else:
-        raise ValueError(
-            f"Unknown camera convention '{convention}'. "
-            "Choose from: 'opengl'|'blender'|'nerf', 'opencv'|'colmap', 'pytorch3d'|'p3d'."
-        )
+        raise ValueError(f"Unknown convention '{convention}'")
 
-    # Rotate directions to world frame: dirs_world = dirs_cam @ R^T
-    ray_directions_world = (
-        ray_directions_camera[..., None, :] @ rotation.transpose(-1, -2)
-    ).squeeze(-2)  # shape (N, 3)
+    # ---- WORLD rays ----
+    rays_d_world_raw  = (dirs_cam @ R.transpose(-1, -2))                   # (N,3)
+    rays_d_world_norm = rays_d_world_raw.norm(dim=-1, keepdim=True)        # (N,1)
+    rays_d_world_unit = rays_d_world_raw / (rays_d_world_norm + 1e-9)
+    rays_o_world      = t.expand_as(rays_d_world_raw)                       # (N,3)
 
-    # Skip normalization if returning rays in NDC coordinates
-    if normalize_dirs and not as_ndc:
-        ray_directions_world = (
-            ray_directions_world / (ray_directions_world.norm(dim=-1, keepdim=True) + 1e-9)
-        )
-
-    # Ray origins: camera position in world for every pixel
-    ray_origins_world = translation.expand_as(ray_directions_world)  # shape (N, 3)
-
-    # If not transforming to NDC coordinates, return
+    # ---- MARCHING rays ----
     if not as_ndc:
-        return ray_origins_world.contiguous(), ray_directions_world.contiguous()
+        # March in WORLD
+        rays_o_marching         = rays_o_world
+        rays_d_marching_unit    = rays_d_world_unit
+        rays_d_marching_norm    = rays_d_world_norm     # (N,1)
 
-    #----- Normalized Device Coordinate transform (forward-facing convention) -----
-    # Transforms the scene into a [-1,1] cube with the near plane at z=0 and far plane at z=1.
-    # Compute translation to bring the ray origins to the near plane
-    translation_ndc = -(near_plane + ray_origins_world[..., 2]) / ray_directions_world[..., 2]
-    ray_origins_world = ray_origins_world + translation_ndc[..., None] * ray_directions_world
+    else:
+        # --- March in NDC to match nerf-pytorch exactly ---
+        # Use WORLD-frame rays directly (not camera-frame), and a scalar focal.
+        # This mirrors: ndc_rays(H, W, focal, near, rays_o, rays_d) from nerf-pytorch.
 
-    # Compute ray origin components via projection
-    ray_origins_ndc_x = -1.0 / (image_w / (2.0 * f_x)) * ray_origins_world[..., 0] / ray_origins_world[..., 2]
-    ray_origins_ndc_y = -1.0 / (image_h / (2.0 * f_y)) * ray_origins_world[..., 1] / ray_origins_world[..., 2]
-    ray_origins_ndc_z = 1.0 + 2.0 * near_plane / ray_origins_world[..., 2]
+        rays_o_w = rays_o_world              # (N,3) world
+        rays_d_w = rays_d_world_raw          # (N,3) world (NOT unit)
 
-    # Compute ray direction components via projection
-    ray_directions_ndc_x = -1.0 / (image_w / (2.0 * f_x)) * (
-        ray_directions_world[..., 0] / ray_directions_world[..., 2]
-        - ray_origins_world[..., 0] / ray_origins_world[..., 2]
+        focal = K[0, 0]                      # scalar focal like official (fx)
+        sx = 2.0 * focal / float(image_w)
+        sy = 2.0 * focal / float(image_h)
+
+        # Shift origins so they intersect the near plane in WORLD-Z
+        # t = -(near + o_z) / d_z  ;  o' = o + t d
+        oz = rays_o_w[..., 2]
+        dz = rays_d_w[..., 2]
+        t_ndc = -(near_plane + oz) / (dz + 1e-9)
+        o_w = rays_o_w + t_ndc[..., None] * rays_d_w
+
+        # NDC origin
+        o0 = -sx * (o_w[..., 0] / (o_w[..., 2] + 1e-9))
+        o1 = -sy * (o_w[..., 1] / (o_w[..., 2] + 1e-9))
+        o2 =  1.0 + 2.0 * near_plane / (o_w[..., 2] + 1e-9)
+
+        # NDC direction (NOT unit)
+        d0 = -sx * ((rays_d_w[..., 0] / (rays_d_w[..., 2] + 1e-9))
+                    - (o_w[..., 0] / (o_w[..., 2] + 1e-9)))
+        d1 = -sy * ((rays_d_w[..., 1] / (rays_d_w[..., 2] + 1e-9))
+                    - (o_w[..., 1] / (o_w[..., 2] + 1e-9)))
+        d2 = -2.0 * near_plane / (o_w[..., 2] + 1e-9)
+
+        rays_o_marching      = torch.stack([o0, o1, o2], dim=-1)
+        rays_d_ndc_raw       = torch.stack([d0, d1, d2], dim=-1)
+        rays_d_marching_norm = rays_d_ndc_raw.norm(dim=-1, keepdim=True)        # used for Δ metric scaling
+        rays_d_marching_unit = torch.nn.functional.normalize(rays_d_ndc_raw, dim=-1)  # used for viewdirs
+
+
+    return (
+        rays_o_world,            # (N,3)
+        rays_d_world_unit,       # (N,3)
+        rays_d_world_norm,       # (N,1)
+        rays_o_marching,         # (N,3)
+        rays_d_marching_unit,    # (N,3)
+        rays_d_marching_norm,    # (N,1)
     )
-    ray_directions_ndc_y = -1.0 / (image_h / (2.0 * f_y)) * (
-        ray_directions_world[..., 1] / ray_directions_world[..., 2]
-        - ray_origins_world[..., 1] / ray_origins_world[..., 2]
-    )
-    ray_directions_ndc_z = -2.0 * near_plane / ray_origins_world[..., 2]
 
-    # Stack components and return
-    ray_origins_ndc = torch.stack(
-        [ray_origins_ndc_x, ray_origins_ndc_y, ray_origins_ndc_z], -1
-    )
-    ray_directions_ndc = torch.stack(
-        [ray_directions_ndc_x, ray_directions_ndc_y, ray_directions_ndc_z], -1
-    )
-
-    return ray_origins_ndc.contiguous(), ray_directions_ndc.contiguous()

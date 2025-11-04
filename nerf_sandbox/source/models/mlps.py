@@ -7,6 +7,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def log_nerf_arch(nerf, pos_enc=None, dir_enc=None, logger=print, name="NeRF"):
+    """
+    Prints a concise table of the trunk layers and heads, highlighting the skip layer.
+    Call this once after constructing the model.
+    """
+    enc_pos_dim = getattr(nerf, "enc_pos_dim", None) or getattr(pos_enc, "out_dim", None)
+    enc_dir_dim = getattr(nerf, "enc_dir_dim", None) or getattr(dir_enc, "out_dim", None)
+    hidden_dim  = getattr(nerf, "hidden_dim", None)
+    n_layers    = getattr(nerf, "n_layers", None)
+    skip_pos    = getattr(nerf, "skip_pos", None)
+
+    logger(f"[{name}] enc_pos_dim={enc_pos_dim} enc_dir_dim={enc_dir_dim} "
+           f"hidden_dim={hidden_dim} n_layers={n_layers} skip_pos={skip_pos}  # 0-based index")
+
+    logger(f"[{name}] Trunk layers (idx  in_features → out_features):")
+    for idx, layer in enumerate(nerf.mlp):
+        mark = "  <-- SKIP (concat γ(x) into INPUT)" if (skip_pos is not None and idx == skip_pos) else ""
+        logger(f"  [{idx:02d}] {layer.in_features} → {layer.out_features}{mark}")
+
+    # Print heads using your actual attribute names
+    for name_attr in ["feature", "sigma_out", "color_fc", "color_out"]:
+        head = getattr(nerf, name_attr, None)
+        if head is not None and hasattr(head, "in_features"):
+            logger(f"[{name}] {name_attr}: {head.in_features} → {head.out_features}")
+
 class NeRF(nn.Module):
     """
     Implements the multi-layer perceptron archicture as described in
@@ -19,7 +44,7 @@ class NeRF(nn.Module):
         enc_dir_dim: int,
         n_layers: int = 8,
         hidden_dim: int = 256,
-        skip_pos: int = 5,
+        skip_pos: int = 4,
         near: float = 2.0,
         far: float = 6.0,
         initial_acc_opacity: float | None = None,
@@ -28,7 +53,7 @@ class NeRF(nn.Module):
         """
         Constructor for the class. Builds the sequential layer architecture, including
         a skip connection where the encoded positional input is concatenated with the
-        activation of the fifth layer.
+        input of the fifth layer by default.
 
         Parameters
         ----------
@@ -41,9 +66,9 @@ class NeRF(nn.Module):
         hidden_dim : int, optional
             The output dimension of the hidden layers. Default is 256.
         skip_pos : int, optional
-            The index of the layer whose activation we concatenate the input encoded
-            position vector. Default is 5, i.e. the encoded position is concatenated
-            with the fifth layer's activation output vector
+            The index of the layer whose input we concatenate with the encoded
+            position vector. Default is 4, i.e. the encoded position is concatenated
+            with the fifth layer's input
         near : float, optional
             Position of the near plane. Default is 2.0
         far : float, optional
@@ -67,13 +92,14 @@ class NeRF(nn.Module):
         layers = []
         in_dim = self.enc_pos_dim
         for idx in range(self.n_layers):
-            # Create the current layer with the current input dimension
-            layers.append(nn.Linear(in_dim, self.hidden_dim))
+            # Check if the current layer's input is concatenated with the encoded position
             if idx == self.skip_pos:
-                # Adjust input dimension to account for concatenation for the next layer
-                in_dim = self.hidden_dim + self.enc_pos_dim
+                # this layer receives [h, γ(x)]
+                layers.append(nn.Linear(in_dim + self.enc_pos_dim, self.hidden_dim))
             else:
-                in_dim = self.hidden_dim
+                layers.append(nn.Linear(in_dim, self.hidden_dim))
+            # Next layer's base input is the hidden size
+            in_dim = self.hidden_dim
 
         self.mlp = nn.ModuleList(layers)
 
@@ -181,15 +207,59 @@ class NeRF(nn.Module):
             where the outputs are [Red, Green, Blue, sigma]
         """
 
+        # Debug logs
+        do_dbg = self._debug_active()
+        if do_dbg:
+            self._debug_decrement_once_per_forward()
+            # input encoder sanity
+            assert enc_pos.shape[-1] == self.enc_pos_dim, \
+                f"enc_pos_dim mismatch: got {enc_pos.shape[-1]} vs {self.enc_pos_dim}"
+            if enc_dir is not None:
+                assert enc_dir.shape[-1] == self.enc_dir_dim, \
+                    f"enc_dir_dim mismatch: got {enc_dir.shape[-1]} vs {self.enc_dir_dim}"
+
         hidden_tensor = enc_pos
 
         # MLP trunk
         for idx, layer in enumerate(self.mlp):
-            # Pass the current hidden tensor through the layer and activation
-            hidden_tensor = F.relu(layer(hidden_tensor))
             if idx == self.skip_pos:
                 # Concatenate the current hidden tensor with the encoded position input
                 hidden_tensor = torch.cat([hidden_tensor, enc_pos], dim=-1)
+
+                # Debug logs
+                if do_dbg:
+                    exp = self.hidden_dim + self.enc_pos_dim
+                    assert layer.in_features == exp, f"Layer {idx} in_features {layer.in_features} != {exp}"
+                    assert hidden_tensor.shape[-1] == exp, f"Layer {idx} input dim {hidden_tensor.shape[-1]} != {exp}"
+                    self._debug_log(f"[dbg] mlp[{idx}] input {hidden_tensor.shape} (skip)")
+
+            else:
+                if do_dbg:
+                    exp = self.enc_pos_dim if idx == 0 else self.hidden_dim
+                    assert layer.in_features == exp, f"Layer {idx} in_features {layer.in_features} != {exp}"
+                    assert hidden_tensor.shape[-1] == exp, f"Layer {idx} input dim {hidden_tensor.shape[-1]} != {exp}"
+                    self._debug_log(f"[dbg] mlp[{idx}] input {hidden_tensor.shape}")
+
+            # Pass the current hidden tensor through the layer and activation
+            hidden_tensor = F.relu(layer(hidden_tensor))
+
+        # Debug logs
+        if do_dbg:
+            # sigma head must see hidden_dim
+            assert self.sigma_out.in_features == self.hidden_dim
+            self._debug_log(f"[dbg] sigma_out in {self.sigma_out.in_features}")
+
+            # COLOR BRANCH
+            # color_fc should take [features (hidden_dim) + encoded_dir (enc_dir_dim if present)]
+            color_fc_expected_in = self.hidden_dim + (self.enc_dir_dim if enc_dir is not None else 0)
+            assert self.color_fc.in_features == color_fc_expected_in, \
+                f"color_fc in_features {self.color_fc.in_features} != {color_fc_expected_in}"
+            self._debug_log(f"[dbg] color_fc in {self.color_fc.in_features}")
+
+            # color_out should take whatever color_fc outputs (your 'color_hidden_dim', 128 here)
+            assert self.color_out.in_features == self.color_fc.out_features, \
+                f"color_out in_features {self.color_out.in_features} != color_fc.out {self.color_fc.out_features}"
+            self._debug_log(f"[dbg] color_out in {self.color_out.in_features}")
 
         # Volume density (RAW logits; no activation here)
         sigma_raw = self.sigma_out(hidden_tensor)
@@ -206,6 +276,43 @@ class NeRF(nn.Module):
         output_tensor = torch.cat([color_raw, sigma_raw], dim=-1)
 
         return output_tensor
+
+    # --- Debug helpers ---
+
+    def enable_debug(self, steps: int = 5, logger=print):
+        """
+        Enable shape/semantics checks for the next `steps` forward passes.
+        After that, debug turns itself off automatically.
+        """
+        self._debug_steps_remaining = int(steps)
+        self._debug_logger = logger
+
+    def _debug_active(self) -> bool:
+        return getattr(self, "_debug_steps_remaining", 0) > 0
+
+    def _debug_log(self, msg: str):
+        log = getattr(self, "_debug_logger", None) or print
+        log(msg)
+
+    def _debug_decrement_once_per_forward(self):
+        # called once at the start of forward()
+        if self._debug_active():
+            self._debug_steps_remaining -= 1
+
+    def _debug_dump_arch_once(self):
+        self._debug_log(
+            f"[NeRF] enc_pos_dim={self.enc_pos_dim} enc_dir_dim={self.enc_dir_dim} "
+            f"hidden_dim={self.hidden_dim} n_layers={self.n_layers} skip_pos={self.skip_pos}"
+        )
+        for idx, layer in enumerate(self.mlp):
+            mark = "  <-- SKIP input concat" if idx == self.skip_pos else ""
+            self._debug_log(f"  mlp[{idx}]: {layer.in_features} → {layer.out_features}{mark}")
+        # use actual attributes:
+        self._debug_log(f"  feature:    {self.feature.in_features} → {self.feature.out_features}")
+        self._debug_log(f"  sigma_out:  {self.sigma_out.in_features} → {self.sigma_out.out_features}")
+        self._debug_log(f"  color_fc:   {self.color_fc.in_features} → {self.color_fc.out_features}")
+        self._debug_log(f"  color_out:  {self.color_out.in_features} → {self.color_out.out_features}")
+
 
 
 if __name__ == "__main__":
