@@ -108,33 +108,7 @@ python nerf_sandbox/source/scripts/train_nerf.py \
 
 On resume, the **validation schedule** and **progress-video state** are reloaded so the next validation block and progress frames continue exactly where they should.
 
----
-
-## CLI tips
-
-Show all options:
-
-python nerf_sandbox/source/scripts/train_nerf.py --help
-
-Common knobs:
-- `--rays_per_batch`, `--nc`, `--nf`, `--raw_noise_std`, `--sigma_activation`
-- `--eval_chunk`, `--val_res_scale`
-- `--num_val_steps`, `--val_schedule {uniform,power}`, `--val_power`
-- `--val_indices 0,3,11` (skip the default “single view” behavior)
-- `--progress_video_during_training --progress_frames 300`
-- `--render_path_after --path_frames 300 --path_type {circle,spiral}`
-
-
-**What `--vanilla` flips under the hood:**
-
-- Encoders: Lx=10 (pos), Ld=4 (dir); include original inputs.
-- Model: 8×256 with mid-skip; ReLU σ, raw σ noise during training.
-- Sampling: N_rand=1024 from a single image per step, **center precrop** warmup.
-- Background: white; near/far default `[2.0, 6.0]`.
-- Learning rate: `5e-4` (cosine/other schedulers optional).
-
----
-
 ## Acknowledgements
 
 - The "vanilla" mode is based off of the original NeRF paper: https://github.com/bmild/nerf
+- PyTorch details and debugging of LLFF implementation was done with help of https://github.com/yenchenlin/nerf-pytorch with excellent blog post https://yconquesty.github.io/blog/ml/nerf/nerf_rendering.html
