@@ -141,6 +141,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_tb", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 
+    # Thermal (optional)
+    p.add_argument("--thermal_throttle", action="store_true")
+    p.add_argument("--gpu_temp_threshold", type=int, default=85)
+    p.add_argument("--gpu_temp_check_every", type=int, default=20)
+    p.add_argument("--gpu_cooldown_seconds", type=int, default=45)
+    p.add_argument("--thermal_throttle_max_micro", type=int, default=16)
+    p.add_argument("--thermal_throttle_sleep", type=float, default=5.0)
+
     # Validation rendering
     p.add_argument("--val_every", type=int, default=None,
                    help="If set, run validation every N steps; otherwise uses an auto schedule")
@@ -167,8 +175,13 @@ def build_argparser() -> argparse.ArgumentParser:
     # Render-only / resume
     p.add_argument("--render_only", action="store_true",
                    help="Skip training; just render a final camera path from a checkpoint")
+    p.add_argument("--auto_resume", action="store_true",
+                    help="If true, resume from newest checkpoint in out_dir/checkpoints.")
+    p.add_argument("--resume_path", type=str, default=None,
+                    help="Path to a specific checkpoint to resume from.")
     p.add_argument("--resume", type=str, default=None,
-                   help="'latest' or a path to a checkpoint to resume from")
+                    help="Convenience: 'latest' or a checkpoint path. Overrides --auto_resume/--resume_path.")
+    p.add_argument("--resume_no_optim", action="store_true")
 
     # Path rendering
     p.add_argument("--render_path_after", action="store_true")
@@ -340,7 +353,7 @@ def apply_path_defaults_from_data_kind(cfg, data_kind: str, *, force: bool = Fal
         _set_default(cfg, "progress_frames",      120,          force=force)
         _set_default(cfg, "path_type",            "llff_spiral",force=force)
         _set_default(cfg, "path_res_scale",       1.0,          force=force)
-        _set_default(cfg, "path_fps",             24,           force=force)
+        _set_default(cfg, "path_fps",             30,           force=force)
 
         # LLFF spiral knobs (official)
         _set_default(cfg, "rots",                 2.0,          force=force)
@@ -353,7 +366,7 @@ def apply_path_defaults_from_data_kind(cfg, data_kind: str, *, force: bool = Fal
         _set_default(cfg, "progress_frames",      120,          force=force)
         _set_default(cfg, "path_type",            "llff_spiral",force=force)
         _set_default(cfg, "path_res_scale",       1.0,          force=force)
-        _set_default(cfg, "path_fps",             24,           force=force)
+        _set_default(cfg, "path_fps",             30,           force=force)
 
         _set_default(cfg, "rots",                 2.5,          force=force)
         _set_default(cfg, "zrate",                0.75,         force=force)
